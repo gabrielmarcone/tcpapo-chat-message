@@ -471,18 +471,38 @@ def test_tratar_cliente_nao_propaga_erro_se_close_falhar_antes_do_login():
 
 def test_loop_accept_retorna_se_socket_ja_estiver_fechado():
     """
-    Fechar o socket ANTES de chamar loop_accept (em vez de tentar
-    interromper um accept() já bloqueado a partir de outra thread, que
-    não tem garantia de funcionar em todas as plataformas/SOs — é uma
-    limitação conhecida de sockets bloqueantes, não um bug do projeto):
-    accept() deve falhar imediatamente com OSError, e loop_accept deve
-    simplesmente retornar, sem lançar exceção nem travar.
+    Fechar o socket ANTES de chamar loop_accept: accept() deve falhar
+    imediatamente com OSError, e loop_accept deve simplesmente retornar,
+    sem lançar exceção nem travar.
     """
     registro = RegistroClientes()
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     sock_servidor.close()
 
     servidor.loop_accept(sock_servidor, registro)  # não deve lançar, nem travar
+
+
+def test_loop_accept_encerra_rapido_mesmo_sem_conexoes_pendentes():
+    """
+    Regressão do bug de Ctrl+C demorado: mesmo com a thread já dentro do
+    loop de accept() e nenhuma conexão pendente, fechar o socket de fora
+    deve fazer a thread terminar rapidamente — graças ao timeout de
+    accept() (TIMEOUT_ACCEPT_SEGUNDOS), não à sorte de o SO interromper
+    uma chamada bloqueante a partir de outra thread (que não tem garantia
+    em todas as plataformas — no Windows, em especial, isso podia demorar
+    muito ou nunca acontecer sem uma conexão nova chegar).
+    """
+    registro = RegistroClientes()
+    sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
+
+    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro), daemon=True)
+    thread.start()
+    time.sleep(0.05)  # garante que a thread já entrou no loop de accept()
+
+    sock_servidor.close()
+    thread.join(timeout=servidor.TIMEOUT_ACCEPT_SEGUNDOS + 1.5)
+
+    assert not thread.is_alive()
 
 
 def test_main_le_porta_via_argumento_e_nao_bloqueia(monkeypatch, capsys):

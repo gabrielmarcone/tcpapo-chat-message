@@ -53,6 +53,7 @@ ecoar de volta seria duplicado. Só os DEMAIS membros da sala recebem.
 
 import argparse
 import socket
+import sys
 import threading
 from typing import Optional
 
@@ -327,9 +328,31 @@ def criar_socket_servidor(host: str, porta: int) -> socket.socket:
     bloqueante (sem timeout) mesmo que o socket de escuta tenha um
     configurado, então tratar_cliente() continua com recv() bloqueante
     normalmente, sem nenhuma mudança de comportamento ali.
+
+    A opção de reuso de endereço é escolhida por plataforma, de propósito
+    (bug real encontrado em teste manual no Windows): SO_REUSEADDR no
+    Linux/Mac só permite reaproveitar uma porta presa em TIME_WAIT depois
+    de uma conexão fechada — nunca deixa dois processos escutarem a
+    mesma porta ativa ao mesmo tempo (confirmado em teste: o segundo
+    bind falha com "Address already in use", como esperado). No Windows,
+    porém, SO_REUSEADDR tem uma semântica bem mais permissiva: ele
+    permite que um SEGUNDO processo faça bind na MESMA porta que já está
+    sendo escutada por outro, sem erro nenhum — os dois "servidores"
+    coexistem silenciosamente, cada conexão nova indo para um ou outro
+    de forma imprevisível, sem nenhum aviso. É uma peculiaridade
+    documentada do WinSock (às vezes chamada de "port hijacking"), bem
+    diferente do Linux. SO_EXCLUSIVEADDRUSE é a opção correta no Windows
+    para esse caso: garante exclusividade de verdade (o segundo bind
+    falha, como deveria), e ainda permite reiniciar rápido o servidor
+    depois que o processo anterior fechou a porta de fato.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    if sys.platform == "win32":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
     sock.bind((host, porta))
     sock.listen()
     sock.settimeout(TIMEOUT_ACCEPT_SEGUNDOS)

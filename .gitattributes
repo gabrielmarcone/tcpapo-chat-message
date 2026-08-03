@@ -1,0 +1,11 @@
+# Normaliza quebras de linha no repositório: sempre LF, independente do
+# sistema operacional de quem clona (evita diffs falsos e conflitos de
+# merge causados só por diferença de \n vs \r\n entre Windows e Linux/Mac).
+
+* text=auto eol=lf
+
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

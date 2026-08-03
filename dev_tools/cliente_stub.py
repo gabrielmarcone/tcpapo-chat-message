@@ -1,47 +1,87 @@
 """
 dev_tools/cliente_stub.py — Cliente simulado, para o Dev A testar o
-servidor.py isoladamente, sem depender do cliente_app.py real.
+servidor.py manualmente no terminal, sem depender do cliente_app.py real.
 
 Dono: DEV A.
 
 Faz parte do repositório (não é descartável) — é evidência, para o
 relatório, de que o servidor foi testado de ponta a ponta antes da
-integração real com o cliente do Dev B.
+integração real com o cliente do Dev B. Usa protocolo.py de verdade para
+montar e interpretar mensagens — nunca constrói ou lê JSON manualmente.
 
-Regra importante: este script usa protocolo.py de verdade (serializar /
-extrair_mensagens) para montar e interpretar mensagens — NUNCA constrói ou
-lê JSON manualmente. Isso garante que o framing real está sendo exercitado
-desde o primeiro teste isolado do servidor, não só na integração final.
+Uso:
+    python dev_tools/cliente_stub.py --ip 127.0.0.1 --porta 5000 --nome alice
 
---------------------------------------------------------------------------
-TODO (Dev A):
---------------------------------------------------------------------------
-1. Conectar no servidor real (IP/porta via argumento simples ou constante
-   de topo do arquivo — não precisa ser tão rigoroso quanto cliente_app.py
-   aqui, é ferramenta de desenvolvimento).
-2. Enviar, em sequência (usando protocolo.py), pelo menos:
-       - login
-       - mensagem_geral
-       - mensagem_privada
-       - listar_usuarios
-       - entrar_sala
-       - sair_sala
-       - sair
-3. Imprimir cada resposta recebida do servidor para inspeção manual durante
-   o desenvolvimento das etapas do servidor.py.
-4. Considerar aceitar argumentos de linha de comando para rodar múltiplas
-   instâncias deste stub ao mesmo tempo (simular vários clientes) — útil
-   para testar concorrência e broadcast antes do cliente_app.py existir.
+Roda uma sequência fixa de ações (login, mensagem geral, tentativa de
+recurso ainda não implementado, sair), imprimindo cada resposta recebida
+do servidor — útil para uma checagem rápida e manual antes de rodar a
+suíte de testes automatizada, ou para observar o comportamento em tempo
+real durante o desenvolvimento das próximas etapas (privada, salas,
+listagem).
 """
 
-import socket  # noqa: F401
+import argparse
+import socket
+import sys
 
-import protocolo  # noqa: F401
+# Permite rodar tanto de dentro de dev_tools/ quanto da raiz do projeto
+sys.path.insert(0, ".")
+import protocolo
 
 
-def main():
-    """TODO (Dev A): implementar conforme os passos acima."""
-    raise NotImplementedError
+def _imprimir(rotulo: str, mensagem: dict) -> None:
+    print(f"[{rotulo}] {mensagem}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Cliente-stub para testar servidor.py manualmente")
+    parser.add_argument("--ip", required=True, help="IP do servidor")
+    parser.add_argument("--porta", type=int, required=True, help="Porta do servidor")
+    parser.add_argument("--nome", default="stub", help="Nome de login a usar (padrao: stub)")
+    args = parser.parse_args()
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(5.0)
+    sock.connect((args.ip, args.porta))
+    print(f"Conectado a {args.ip}:{args.porta}")
+
+    buffer = b""
+
+    def enviar(mensagem: dict) -> None:
+        _imprimir("enviando", mensagem)
+        sock.sendall(protocolo.serializar(mensagem))
+
+    def receber_uma() -> dict:
+        nonlocal buffer
+        while True:
+            mensagens, buffer = protocolo.extrair_mensagens(buffer)
+            if mensagens:
+                _imprimir("recebido", mensagens[0])
+                return mensagens[0]
+            dados = sock.recv(4096)
+            if not dados:
+                raise ConnectionError("servidor fechou a conexao inesperadamente")
+            buffer += dados
+
+    # --- sequência de teste manual ---
+    enviar(protocolo.msg_login(args.nome))
+    resposta = receber_uma()
+    if resposta["tipo"] != protocolo.TIPO_LOGIN_OK:
+        print("Login falhou, encerrando.")
+        sock.close()
+        return
+
+    enviar(protocolo.msg_mensagem_geral_enviar("mensagem de teste do cliente-stub"))
+
+    enviar(protocolo.msg_listar_usuarios())
+    receber_uma()  # hoje ainda responde 'erro' (nao implementado nesta etapa)
+
+    enviar(protocolo.msg_sair())
+
+    dados = sock.recv(4096)
+    print("Conexao encerrada pelo servidor." if not dados else f"Dado inesperado apos sair: {dados!r}")
+
+    sock.close()
 
 
 if __name__ == "__main__":

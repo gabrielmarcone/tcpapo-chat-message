@@ -190,15 +190,54 @@ def test_extrair_bytes_invalidos_utf8_levanta_erro_claro():
 
 
 def test_extrair_mensagem_invalida_no_meio_do_buffer_preserva_as_validas_antes():
-    # uma mensagem válida seguida de uma inválida: a extração deve
-    # levantar erro (não mascarar o problema), mas isso não deve corromper
-    # o que já foi validado antes dela na mesma chamada
-    valida = protocolo.serializar(protocolo.msg_sair())
+    """
+    Este é o teste que teria pegado, em protocolo.py, o bug encontrado
+    depois via teste de integração em servidor.py: sem os atributos
+    mensagens_processadas/buffer_restante na exceção, quem chama perderia
+    tanto a mensagem válida de antes quanto a posição no buffer — ficando
+    preso reprocessando a mesma linha ruim para sempre.
+    """
+    valida1 = protocolo.serializar(protocolo.msg_sair())
     invalida = json.dumps({"sem_tipo": True}).encode("utf-8") + b"\n"
-    buffer = valida + invalida
+    valida2 = protocolo.serializar(protocolo.msg_listar_usuarios())
+    buffer = valida1 + invalida + valida2
 
-    with pytest.raises(ErroProtocolo):
+    with pytest.raises(ErroProtocolo) as exc_info:
         protocolo.extrair_mensagens(buffer)
+
+    erro = exc_info.value
+    # a mensagem válida ANTES da linha ruim não pode ser perdida
+    assert erro.mensagens_processadas == [{"tipo": "sair"}]
+
+    # o buffer_restante deve conter a mensagem válida DEPOIS da linha
+    # ruim, pronta para ser extraída numa nova chamada — sem reprocessar
+    # a linha malformada de novo
+    mensagens_restantes, resto_final = protocolo.extrair_mensagens(erro.buffer_restante)
+    assert mensagens_restantes == [{"tipo": "listar_usuarios"}]
+    assert resto_final == b""
+
+
+def test_extrair_erro_sem_mensagens_processadas_usa_valores_padrao():
+    # quando a linha ruim é a primeira do buffer, não há nada antes dela
+    buffer = json.dumps({"sem_tipo": True}).encode("utf-8") + b"\n"
+    with pytest.raises(ErroProtocolo) as exc_info:
+        protocolo.extrair_mensagens(buffer)
+
+    erro = exc_info.value
+    assert erro.mensagens_processadas == []
+    assert erro.buffer_restante == b""
+
+
+def test_erro_protocolo_levantado_por_serializar_tem_valores_padrao():
+    # serializar() não tem conceito de "buffer" — os atributos extras
+    # devem existir com valores padrão inofensivos, sem quebrar quem
+    # captura a exceção esperando só a mensagem de texto
+    with pytest.raises(ErroProtocolo) as exc_info:
+        protocolo.serializar({"nome": "sem tipo"})
+
+    erro = exc_info.value
+    assert erro.mensagens_processadas == []
+    assert erro.buffer_restante == b""
 
 
 # --------------------------------------------------------------------------

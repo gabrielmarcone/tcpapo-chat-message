@@ -397,7 +397,23 @@ def main() -> None:
     args = parser.parse_args()
 
     registro = RegistroClientes()
-    socket_servidor = criar_socket_servidor(HOST_PADRAO, args.porta)
+
+    try:
+        socket_servidor = criar_socket_servidor(HOST_PADRAO, args.porta)
+    except OSError as erro:
+        # Caso mais comum aqui: porta já em uso (outro servidor.py já
+        # rodando nela, ou outro processo qualquer). Sem este tratamento,
+        # o usuário via um traceback cru — inconsistente com o padrão de
+        # mensagens amigáveis já usado em cliente_app.py para erros
+        # equivalentes do lado do cliente.
+        print(f"[erro] não foi possível iniciar o servidor na porta {args.porta}: {erro}")
+        print(
+            "[dica] a porta provavelmente já está em uso (outro servidor.py "
+            "já rodando nela?) — tente outra porta com --porta, ou encerre "
+            "o processo que já está usando essa."
+        )
+        sys.exit(1)
+
     print(f"Servidor escutando em {HOST_PADRAO}:{args.porta} (Ctrl+C para encerrar)")
 
     try:

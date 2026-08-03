@@ -92,8 +92,30 @@ class ErroProtocolo(Exception):
     vazia). Levantada tanto por serializar() (uso local incorreto) quanto
     por extrair_mensagens() (dado malformado vindo da rede) — ver decisão
     1 no docstring do módulo.
+
+    Quando levantada por extrair_mensagens() no meio do processamento de
+    um buffer com mais de uma mensagem, carrega dois atributos extras
+    para que quem chama não perca o progresso já feito (bug encontrado
+    via teste de integração: sem isso, a linha malformada nunca era
+    consumida do buffer, e o servidor ficava preso reprocessando a mesma
+    linha ruim para sempre, nunca alcançando mensagens válidas seguintes):
+
+        mensagens_processadas: lista de mensagens válidas já extraídas
+            ANTES da linha que causou o erro — podem ser processadas
+            normalmente por quem chama.
+        buffer_restante: o que sobra do buffer imediatamente APÓS a linha
+            malformada (que já foi descartada) — pronto para uma nova
+            chamada a extrair_mensagens, sem reprocessar a linha ruim.
+
+    Quando levantada por serializar() (que não tem conceito de "buffer"),
+    esses atributos ficam com seus valores padrão (lista vazia / bytes
+    vazios) e podem ser ignorados.
     """
-    pass
+
+    def __init__(self, mensagem: str, mensagens_processadas=None, buffer_restante: bytes = b""):
+        super().__init__(mensagem)
+        self.mensagens_processadas = mensagens_processadas if mensagens_processadas is not None else []
+        self.buffer_restante = buffer_restante
 
 
 # --------------------------------------------------------------------------
@@ -205,14 +227,31 @@ def extrair_mensagens(buffer: bytes) -> tuple[list, bytes]:
         try:
             texto = linha_bytes.decode(ENCODING)
         except UnicodeDecodeError as exc:
-            raise ErroProtocolo(f"linha recebida não é utf-8 válido: {linha_bytes!r}") from exc
+            raise ErroProtocolo(
+                f"linha recebida não é utf-8 válido: {linha_bytes!r}",
+                mensagens_processadas=mensagens,
+                buffer_restante=buffer,
+            ) from exc
 
         try:
             mensagem = json.loads(texto)
         except json.JSONDecodeError as exc:
-            raise ErroProtocolo(f"linha recebida não é um JSON válido: {texto!r}") from exc
+            raise ErroProtocolo(
+                f"linha recebida não é um JSON válido: {texto!r}",
+                mensagens_processadas=mensagens,
+                buffer_restante=buffer,
+            ) from exc
 
-        _validar_mensagem(mensagem, origem="extrair_mensagens")
+        try:
+            _validar_mensagem(mensagem, origem="extrair_mensagens")
+        except ErroProtocolo as erro:
+            # _validar_mensagem não sabe de buffer/progresso (é usada
+            # também por serializar) — reempacota aqui com o contexto de
+            # recuperação, sem duplicar a lógica de validação.
+            raise ErroProtocolo(
+                str(erro), mensagens_processadas=mensagens, buffer_restante=buffer
+            ) from erro
+
         mensagens.append(mensagem)
 
     return mensagens, buffer

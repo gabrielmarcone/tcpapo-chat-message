@@ -19,6 +19,7 @@ RegistroClientes.
 """
 
 import socket
+import sys
 import threading
 import time
 
@@ -465,6 +466,44 @@ def test_tratar_cliente_nao_propaga_erro_se_close_falhar_antes_do_login():
     servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro)  # não deve propagar
 
 
+class _SocketFalsoQueQuebraNoRecv:
+    """
+    Fake de socket cujo recv() levanta OSError depois do login (em vez de
+    retornar b""), simulando uma queda abrupta de conexão (ex:
+    ConnectionResetError) durante o loop de roteamento de mensagens —
+    cobre o `except OSError` externo de tratar_cliente, distinto do caso
+    "recv retorna vazio" (fechamento gracioso, já coberto por outro
+    teste).
+    """
+
+    def __init__(self, mensagens_para_receber):
+        self._fila_recv = list(mensagens_para_receber)
+
+    def recv(self, _tamanho):
+        if self._fila_recv:
+            return self._fila_recv.pop(0)
+        raise OSError("conexao resetada abruptamente (simulado)")
+
+    def sendall(self, _dados):
+        pass
+
+    def close(self):
+        pass
+
+
+def test_tratar_cliente_trata_oserror_abrupto_durante_roteamento_sem_propagar():
+    registro = RegistroClientes()
+    login_bytes = protocolo.serializar(protocolo.msg_login("alice"))
+    sock_falso = _SocketFalsoQueQuebraNoRecv([login_bytes])
+
+    # apos o login, o proximo recv() levanta OSError (simulando reset) em
+    # vez de retornar b"" -- deve ser tratado pelo except OSError externo,
+    # sem propagar, e o cliente deve ser removido do registro do mesmo jeito
+    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro)
+
+    assert registro.buscar("alice") is None
+
+
 # --------------------------------------------------------------------------
 # Bootstrap: criar_socket_servidor, loop_accept, main
 # --------------------------------------------------------------------------
@@ -503,6 +542,45 @@ def test_loop_accept_encerra_rapido_mesmo_sem_conexoes_pendentes():
     thread.join(timeout=servidor.TIMEOUT_ACCEPT_SEGUNDOS + 1.5)
 
     assert not thread.is_alive()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="comportamento de SO_REUSEADDR e diferente no Windows")
+def test_criar_socket_servidor_impede_dois_binds_na_mesma_porta_linux_mac():
+    """
+    No Linux/Mac, dois sockets não podem escutar a mesma porta ao mesmo
+    tempo, mesmo com SO_REUSEADDR — o segundo bind deve falhar. Já
+    confirmado manualmente (dois processos reais na mesma porta), este
+    teste automatiza essa mesma garantia.
+    """
+    sock1 = servidor.criar_socket_servidor("127.0.0.1", 0)
+    porta = sock1.getsockname()[1]
+
+    with pytest.raises(OSError):
+        servidor.criar_socket_servidor("127.0.0.1", porta)
+
+    sock1.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="SO_EXCLUSIVEADDRUSE so existe no Windows")
+def test_criar_socket_servidor_impede_dois_binds_na_mesma_porta_windows():
+    """
+    Regressão do bug real encontrado em teste manual no Windows: com
+    SO_REUSEADDR puro, o Windows permitia dois processos escutando a
+    MESMA porta ao mesmo tempo, silenciosamente (sem erro nenhum) — bem
+    diferente do Linux/Mac. SO_EXCLUSIVEADDRUSE corrige isso: o segundo
+    bind deve falhar, exatamente como no Linux/Mac.
+
+    Só roda no Windows (skipped em outras plataformas) porque
+    SO_EXCLUSIVEADDRUSE nem existe no módulo socket fora do Windows —
+    não há como simular esse comportamento de outra forma.
+    """
+    sock1 = servidor.criar_socket_servidor("127.0.0.1", 0)
+    porta = sock1.getsockname()[1]
+
+    with pytest.raises(OSError):
+        servidor.criar_socket_servidor("127.0.0.1", porta)
+
+    sock1.close()
 
 
 def test_main_le_porta_via_argumento_e_nao_bloqueia(monkeypatch, capsys):

@@ -4,7 +4,7 @@ cliente_app.py — Cliente de chat (tcpapo-chat-message)
 Dono: Desenvolvedor B (ver Plano de Divisão de Trabalho, seção 9).
 NÃO editado por outra pessoa sem revisão via Pull Request.
 
-Escopo implementado neste arquivo (etapas 1 a 3 da tabela da seção 9):
+Escopo implementado neste arquivo (etapas 1 a 4 da tabela da seção 9):
 
     Etapa 1 — Leitura de IP/porta via linha de comando (IP obrigatório,
               sem valor padrão; porta com valor padrão) + conexão TCP,
@@ -14,21 +14,26 @@ Escopo implementado neste arquivo (etapas 1 a 3 da tabela da seção 9):
     Etapa 3 — Concorrência: thread dedicada exclusivamente à recepção
               (recv + desserializa + imprime); a thread principal só lê
               input() e envia.
+    Etapa 4 — Parsing de comandos digitados pelo usuário (texto comum,
+              /priv, /lista, /entrar, /sair_sala, /sair), isolado em
+              parse_comando() para não espalhar ifs pelo main().
 
 NÃO implementado ainda (fica para as próximas etapas do Dev B):
-    - parsing de comandos (/priv, /lista, /entrar, /sair_sala, /sair);
-    - mensagens privadas, listagem de usuários, salas;
-    - tests/test_cliente.py.
-Por enquanto, todo texto digitado pelo usuário é enviado como mensagem
-geral (broadcast na sala atual), usando exclusivamente
-protocolo.msg_mensagem_geral_enviar().
+    - tratamento de erros mais robusto de conexão em tempo de execução
+      (etapa 5);
+    - tests/test_cliente.py (etapa 6).
+
+Todo texto digitado que não seja um comando reconhecido (não começa com
+"/", ou é um "/" desconhecido/malformado) é tratado como mensagem geral
+(broadcast na sala atual) ou como comando inválido — ver parse_comando().
 """
 
 import argparse
+import os
 import socket
 import sys
 import threading
-from typing import Tuple
+from typing import Optional, Tuple
 
 import protocolo
 
@@ -90,10 +95,22 @@ def imprimir_mensagem(msg: dict) -> None:
         print(f"* {msg.get('texto', '')}")
     elif tipo == protocolo.TIPO_ERRO:
         print(f"[erro do servidor] {msg.get('motivo', '')}")
+    elif tipo == protocolo.TIPO_LISTA_USUARIOS:
+        # Adicionado na etapa 4: sem isso, a resposta de /lista caía no
+        # "else" genérico abaixo e mostrava o dict cru na tela.
+        usuarios = msg.get("usuarios", [])
+        if not usuarios:
+            print("[lista] nenhum usuário conectado.")
+        else:
+            print("[lista] usuários conectados:")
+            for usuario in usuarios:
+                nome = usuario.get("nome", "?")
+                sala = usuario.get("sala", "?")
+                print(f"    - {nome} (sala: {sala})")
     else:
-        # Tipo não tratado ainda nesta etapa (ex: lista_usuarios, que só
-        # fará sentido quando /lista for implementado). Não inventamos
-        # formatação para campos que não conhecemos — só exibimos bruto.
+        # Tipo não tratado ainda (não deveria acontecer, dado o contrato
+        # fechado de protocolo.py). Não inventamos formatação para campos
+        # que não conhecemos — só exibimos bruto.
         print(f"[{tipo}] {msg}")
 
 
@@ -197,7 +214,7 @@ def thread_recepcao(
         if not dados:
             print("\n[servidor] a conexão foi encerrada pelo servidor.")
             evento_encerrando.set()
-            break
+            os._exit(0)
 
         buffer += dados
         try:
@@ -237,6 +254,114 @@ def enviar(sock: socket.socket, mensagem: dict) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Etapa 4 — parsing de comandos
+# --------------------------------------------------------------------------
+# Todas as ações possíveis do que o usuário digita, decididas em um único
+# lugar (parse_comando) em vez de espalhadas como ifs pelo main().
+
+ACAO_ENVIAR = "enviar"      # mensagem pronta (dict) para enviar ao servidor
+ACAO_SAIR = "sair"          # usuário pediu /sair: quem chama deve encerrar
+ACAO_INVALIDO = "invalido"  # comando malformado/desconhecido; ajuda já impressa
+ACAO_VAZIO = "vazio"        # linha vazia/só espaço; nada a fazer
+
+COMANDO_PRIV = "/priv"
+COMANDO_LISTA = "/lista"
+COMANDO_ENTRAR = "/entrar"
+COMANDO_SAIR_SALA = "/sair_sala"
+COMANDO_SAIR = "/sair"
+
+TEXTO_AJUDA_COMANDOS = (
+    "Comandos disponíveis:\n"
+    f"  {COMANDO_PRIV} <usuario> <mensagem>  - envia mensagem privada\n"
+    f"  {COMANDO_LISTA}                      - lista usuários conectados\n"
+    f"  {COMANDO_ENTRAR} <sala>              - entra em uma sala\n"
+    f"  {COMANDO_SAIR_SALA}                  - volta para a sala geral\n"
+    f"  {COMANDO_SAIR}                       - encerra a conexão\n"
+    "Qualquer outro texto (que não comece com '/') é enviado como mensagem geral."
+)
+
+
+def _comando_invalido(uso: str) -> Tuple[str, None]:
+    """Imprime a mensagem de ajuda para um comando malformado e devolve o
+    par (ACAO_INVALIDO, None) que parse_comando() deve retornar. Nenhuma
+    mensagem é enviada ao servidor nesse caso."""
+    print(f"[uso] {uso}")
+    print(TEXTO_AJUDA_COMANDOS)
+    return ACAO_INVALIDO, None
+
+
+def parse_comando(texto: str) -> Tuple[str, Optional[dict]]:
+    """
+    Interpreta uma linha digitada pelo usuário e decide o que fazer com
+    ela, sem nunca levantar exceção — qualquer entrada do usuário
+    (incluindo lixo) é tratada aqui dentro.
+
+    Retorna (acao, mensagem):
+        (ACAO_ENVIAR, dict)   -> dict é uma mensagem pronta, já montada
+                                 com uma função protocolo.msg_*, para
+                                 enviar ao servidor.
+        (ACAO_SAIR, None)     -> usuário digitou '/sair'; quem chama deve
+                                 encerrar a conexão (não há nada a enviar
+                                 ao servidor: o encerramento é local,
+                                 conforme decisão já tomada em
+                                 encerrar()/main() para esta etapa).
+        (ACAO_INVALIDO, None) -> a linha começa com '/' mas não é um
+                                 comando reconhecido, ou está mal
+                                 formada (faltam argumentos obrigatórios,
+                                 ou há argumentos onde não deveria).
+                                 A mensagem de ajuda já foi impressa;
+                                 nada deve ser enviado ao servidor.
+        (ACAO_VAZIO, None)    -> linha vazia ou só espaços em branco;
+                                 nada a fazer.
+
+    Texto comum (que não começa com '/') vira sempre mensagem geral, via
+    protocolo.msg_mensagem_geral_enviar() — igual ao comportamento das
+    etapas 1-3, sem mudança para quem só digita texto normal.
+    """
+    texto = texto.strip()
+
+    if not texto:
+        return ACAO_VAZIO, None
+
+    if not texto.startswith("/"):
+        return ACAO_ENVIAR, protocolo.msg_mensagem_geral_enviar(texto)
+
+    partes = texto.split(maxsplit=1)
+    comando = partes[0].lower()
+    resto = partes[1] if len(partes) > 1 else ""
+
+    if comando == COMANDO_PRIV:
+        sub_partes = resto.split(maxsplit=1)
+        if len(sub_partes) < 2 or not sub_partes[1].strip():
+            return _comando_invalido(f"{COMANDO_PRIV} <usuario> <mensagem>")
+        destinatario, texto_msg = sub_partes[0], sub_partes[1]
+        return ACAO_ENVIAR, protocolo.msg_mensagem_privada_enviar(destinatario, texto_msg)
+
+    if comando == COMANDO_LISTA:
+        if resto:
+            return _comando_invalido(f"{COMANDO_LISTA} não aceita argumentos")
+        return ACAO_ENVIAR, protocolo.msg_listar_usuarios()
+
+    if comando == COMANDO_ENTRAR:
+        sala = resto.strip()
+        if not sala:
+            return _comando_invalido(f"{COMANDO_ENTRAR} <sala>")
+        return ACAO_ENVIAR, protocolo.msg_entrar_sala(sala)
+
+    if comando == COMANDO_SAIR_SALA:
+        if resto:
+            return _comando_invalido(f"{COMANDO_SAIR_SALA} não aceita argumentos")
+        return ACAO_ENVIAR, protocolo.msg_sair_sala()
+
+    if comando == COMANDO_SAIR:
+        if resto:
+            return _comando_invalido(f"{COMANDO_SAIR} não aceita argumentos")
+        return ACAO_SAIR, None
+
+    return _comando_invalido(f"comando desconhecido '{comando}'")
+
+
+# --------------------------------------------------------------------------
 # Encerramento
 # --------------------------------------------------------------------------
 
@@ -244,11 +369,12 @@ def encerrar(sock: socket.socket, evento_encerrando: threading.Event) -> None:
     """
     Fecha a conexão de forma organizada.
 
-    Nesta etapa não enviamos protocolo.msg_sair() aqui de propósito: o
-    comando /sair pertence ao parser de comandos (próxima etapa do Dev
-    B). O servidor já trata desconexão abrupta como caminho normal (ver
-    plano, tarefa 11 do Dev A), então simplesmente fechar o socket é
-    suficiente e correto para o escopo atual.
+    O comando /sair (via parse_comando) apenas sinaliza para o main()
+    encerrar localmente — não enviamos protocolo.msg_sair() pela rede de
+    propósito nesta etapa, já que o servidor já trata desconexão abrupta
+    como caminho normal (ver plano, tarefa 11 do Dev A), então
+    simplesmente fechar o socket é suficiente e correto para o escopo
+    atual.
     """
     evento_encerrando.set()
     try:
@@ -289,7 +415,9 @@ def main() -> None:
     thread.start()
 
     print(f"Bem-vindo(a), {nome}. Digite uma mensagem e pressione Enter "
-          f"para enviar ao chat geral. Ctrl+C para sair.")
+          f"para enviar ao chat geral, ou {COMANDO_SAIR} para encerrar. "
+          f"Ctrl+C também encerra.")
+    print(TEXTO_AJUDA_COMANDOS)
 
     try:
         while not evento_encerrando.is_set():
@@ -302,10 +430,18 @@ def main() -> None:
             if evento_encerrando.is_set():
                 # servidor pode ter caído enquanto o usuário digitava
                 break
-            if not texto.strip():
+
+            acao, mensagem = parse_comando(texto)
+
+            if acao in (ACAO_VAZIO, ACAO_INVALIDO):
                 continue
 
-            enviar(sock, protocolo.msg_mensagem_geral_enviar(texto))
+            if acao == ACAO_SAIR:
+                print(f"[info] encerrando ({COMANDO_SAIR})...")
+                break
+
+            # acao == ACAO_ENVIAR
+            enviar(sock, mensagem)
     except KeyboardInterrupt:
         print("\n[info] encerrando (Ctrl+C)...")
     finally:

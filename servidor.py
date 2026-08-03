@@ -63,6 +63,17 @@ HOST_PADRAO = "0.0.0.0"
 PORTA_PADRAO = 5000
 TAMANHO_BUFFER_RECV = 4096
 
+# Timeout do accept() do socket de escuta — não tem relação com timeout de
+# leitura de clientes conectados (esses continuam bloqueantes, sem prazo).
+# Existe só para o loop principal "acordar" periodicamente e checar se deve
+# parar, em vez de ficar bloqueado indefinidamente em accept(). Sem isso,
+# Ctrl+C podia demorar muito para ser percebido (sobretudo no Windows, onde
+# um KeyboardInterrupt só é entregue de forma confiável quando o processo
+# está executando bytecode Python, não quando está preso numa chamada
+# bloqueante de baixo nível) — o servidor só "acordava" quando uma conexão
+# nova chegava e liberava o accept().
+TIMEOUT_ACCEPT_SEGUNDOS = 0.5
+
 # Tipos de mensagem cujo roteamento ainda não foi implementado nesta etapa
 # (etapas 6-8 do plano) — respondem com erro explícito em vez de serem
 # ignorados silenciosamente ou derrubarem a conexão.
@@ -309,23 +320,37 @@ def criar_socket_servidor(host: str, porta: int) -> socket.socket:
     Separado de main() para permitir testes de integração reais: os
     testes chamam isso com porta=0 (o SO escolhe uma porta livre) e
     inspecionam sock.getsockname()[1] para saber qual foi escolhida.
+
+    O timeout de accept() (TIMEOUT_ACCEPT_SEGUNDOS) é configurado aqui,
+    não nos sockets de cliente aceitos depois — o Python já garante isso
+    automaticamente: um socket retornado por accept() nasce em modo
+    bloqueante (sem timeout) mesmo que o socket de escuta tenha um
+    configurado, então tratar_cliente() continua com recv() bloqueante
+    normalmente, sem nenhuma mudança de comportamento ali.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, porta))
     sock.listen()
+    sock.settimeout(TIMEOUT_ACCEPT_SEGUNDOS)
     return sock
 
 
 def loop_accept(socket_servidor: socket.socket, registro: RegistroClientes) -> None:
     """
     Loop principal: aceita conexões e dispara uma thread dedicada para
-    cada uma. Nunca bloqueia em nada além de accept(). Retorna quando
-    socket_servidor é fechado por fora (ex: encerramento do servidor).
+    cada uma. Nunca bloqueia por mais que TIMEOUT_ACCEPT_SEGUNDOS de cada
+    vez — o timeout do socket de escuta faz accept() retornar
+    periodicamente mesmo sem conexão nenhuma, para que Ctrl+C (ou outro
+    sinal de encerramento) seja percebido rápido, em vez de só quando uma
+    conexão nova chegar. Retorna quando socket_servidor é fechado por
+    fora (ex: encerramento do servidor).
     """
     while True:
         try:
             sock_cliente, endereco = socket_servidor.accept()
+        except socket.timeout:
+            continue  # só um "despertar" periódico — nada de errado aconteceu
         except OSError:
             return  # socket_servidor foi fechado — encerramento normal
 

@@ -604,6 +604,29 @@ def test_main_le_porta_via_argumento_e_nao_bloqueia(monkeypatch, capsys):
     assert "Servidor escutando em" in saida
 
 
+def test_main_porta_ja_em_uso_mostra_erro_amigavel_sem_traceback(monkeypatch, capsys):
+    """
+    Regressão de UX: antes deste teste, uma porta já em uso (ex: dois
+    servidor.py na mesma porta) derrubava main() com um traceback cru —
+    inconsistente com o padrão de mensagens amigáveis já usado em
+    cliente_app.py. Agora deve sair com código 1 e mensagem clara,
+    sem propagar a exceção original.
+    """
+    def criar_socket_servidor_fake(_host, _porta):
+        raise OSError("[Errno 98] Address already in use")
+
+    monkeypatch.setattr(servidor, "criar_socket_servidor", criar_socket_servidor_fake)
+    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "5000"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        servidor.main()
+
+    assert exc_info.value.code == 1
+    saida = capsys.readouterr().out
+    assert "não foi possível iniciar o servidor" in saida
+    assert "já está em uso" in saida
+
+
 def test_main_trata_keyboardinterrupt_sem_propagar(monkeypatch, capsys):
     def loop_accept_fake(_sock_servidor, _registro):
         raise KeyboardInterrupt

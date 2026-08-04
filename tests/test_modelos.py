@@ -68,6 +68,20 @@ def test_adicionar_nome_duplicado_retorna_false():
     assert registro.quantidade() == 1  # o segundo NÃO deve ter sobrescrito o primeiro
 
 
+def test_adicionar_nome_duplicado_sem_distincao_de_maiusculas_minusculas():
+    """
+    Bug real observado: 'Alice' e 'alice' conseguiam se conectar ao
+    mesmo tempo como usuários "diferentes" — confuso pra quem tenta
+    mandar mensagem privada usando o case que lembra, e potencialmente
+    dois clientes pensando que são o único 'Alice' do chat.
+    """
+    registro = RegistroClientes()
+    assert registro.adicionar(_cliente_fake("Alice")) is True
+    assert registro.adicionar(_cliente_fake("alice")) is False
+    assert registro.adicionar(_cliente_fake("ALICE")) is False
+    assert registro.quantidade() == 1
+
+
 def test_remover_cliente_existente():
     registro = RegistroClientes()
     registro.adicionar(_cliente_fake("alice"))
@@ -98,6 +112,28 @@ def test_buscar_retorna_o_mesmo_objeto():
     assert registro.buscar("alice") is cliente
 
 
+def test_buscar_sem_distincao_de_maiusculas_minusculas():
+    registro = RegistroClientes()
+    cliente = _cliente_fake("Alice")
+    registro.adicionar(cliente)
+
+    # busca com qualquer combinação de case deve achar o mesmo objeto
+    assert registro.buscar("alice") is cliente
+    assert registro.buscar("ALICE") is cliente
+    assert registro.buscar("aLiCe") is cliente
+
+    # e o nome de EXIBIÇÃO continua com a capitalização original
+    assert registro.buscar("alice").nome == "Alice"
+
+
+def test_remover_sem_distincao_de_maiusculas_minusculas():
+    registro = RegistroClientes()
+    registro.adicionar(_cliente_fake("Alice"))
+    registro.remover("alice")  # remove usando case diferente do cadastro
+    assert registro.buscar("Alice") is None
+    assert registro.quantidade() == 0
+
+
 # --------------------------------------------------------------------------
 # RegistroClientes — mudar_sala
 # --------------------------------------------------------------------------
@@ -107,6 +143,13 @@ def test_mudar_sala_de_cliente_existente():
     registro.adicionar(_cliente_fake("alice"))
     assert registro.mudar_sala("alice", "jogos") is True
     assert registro.buscar("alice").sala_atual == "jogos"
+
+
+def test_mudar_sala_sem_distincao_de_maiusculas_minusculas():
+    registro = RegistroClientes()
+    registro.adicionar(_cliente_fake("Alice"))
+    assert registro.mudar_sala("ALICE", "jogos") is True
+    assert registro.buscar("Alice").sala_atual == "jogos"
 
 
 def test_mudar_sala_de_cliente_inexistente_retorna_false():
@@ -223,6 +266,33 @@ def test_adicionar_mesmo_nome_sob_concorrencia():
 
     assert resultados.count(True) == 1
     assert resultados.count(False) == n - 1
+    assert registro.quantidade() == 1
+
+
+def test_adicionar_mesmo_nome_com_cases_diferentes_sob_concorrencia():
+    """
+    Mesmo teste acima, mas cada thread tenta um CASE diferente do mesmo
+    nome ("Alice", "alice", "ALICE", "aLiCe", ...) — a normalização por
+    casefold() precisa continuar garantindo que só uma vence, mesmo
+    quando nenhuma delas literalmente bate com as outras char a char.
+    """
+    registro = RegistroClientes()
+    variantes = ["alice", "Alice", "ALICE", "aLiCe", "AlIcE"] * 6  # 30 tentativas
+    barreira = threading.Barrier(len(variantes))
+    resultados = [None] * len(variantes)
+
+    def tarefa(indice, nome):
+        barreira.wait()
+        resultados[indice] = registro.adicionar(_cliente_fake(nome))
+
+    threads = [threading.Thread(target=tarefa, args=(i, nome)) for i, nome in enumerate(variantes)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert resultados.count(True) == 1
+    assert resultados.count(False) == len(variantes) - 1
     assert registro.quantidade() == 1
 
 

@@ -148,12 +148,96 @@ def test_login_com_nome_vazio_e_rejeitado(servidor_rodando):
     c = ClienteDeTeste(porta)
 
     c.enviar({"tipo": "login", "nome": "   "})
-    assert c.receber()["tipo"] == "erro"
+    assert c.receber()["tipo"] == "login_erro"
 
     c.enviar(protocolo.msg_login("alice"))
     assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
 
     c.fechar()
+
+
+def test_login_com_nome_contendo_espaco_e_rejeitado(servidor_rodando):
+    """
+    Bug real encontrado em teste manual: um apelido com espaço (ex:
+    "Joao Pedro") é aceito no login, mas quebra /priv — que espera
+    exatamente dois argumentos separados por espaço (destinatário e
+    texto), então só "Joao" (a primeira palavra) era usado como
+    destinatário, e a mensagem privada sempre falhava com "destinatario
+    'Joao' nao encontrado". Em vez de complicar o parsing do cliente com
+    aspas/escape, a correção é simples e direta: apelido não pode conter
+    espaço, com erro claro na hora do login (não só descoberto depois,
+    ao tentar usar /priv).
+    """
+    porta, registro = servidor_rodando
+    c = ClienteDeTeste(porta)
+
+    c.enviar(protocolo.msg_login("Joao Pedro"))
+    resposta = c.receber()
+    assert resposta["tipo"] == "login_erro"
+    assert "espaco" in resposta["motivo"]
+    assert registro.buscar("Joao Pedro") is None
+
+    # conexão continua viva — pode tentar de novo com um nome válido
+    c.enviar(protocolo.msg_login("joao_pedro"))
+    assert c.receber() == {"tipo": "login_ok", "nome": "joao_pedro"}
+
+    c.fechar()
+
+
+def test_login_com_nome_contendo_tab_ou_quebra_de_linha_e_rejeitado(servidor_rodando):
+    """
+    Mesma validação, mas com outros caracteres de espaço em branco além
+    do espaço comum — usa any(c.isspace() ...) no servidor, não só a
+    checagem de " " literal, então tab e \\n também devem ser pegos.
+    """
+    porta, _registro = servidor_rodando
+    c = ClienteDeTeste(porta)
+
+    c.enviar(protocolo.msg_login("joao\tpedro"))
+    assert c.receber()["tipo"] == "login_erro"
+
+    c.fechar()
+
+
+def test_login_com_nome_muito_longo_e_rejeitado(servidor_rodando):
+    porta, registro = servidor_rodando
+    c = ClienteDeTeste(porta)
+
+    nome_longo = "x" * 150
+    c.enviar(protocolo.msg_login(nome_longo))
+    resposta = c.receber()
+    assert resposta["tipo"] == "login_erro"
+    assert "longo" in resposta["motivo"]
+    assert registro.buscar(nome_longo) is None
+
+    c.enviar(protocolo.msg_login("alice"))
+    assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
+
+    c.fechar()
+
+
+def test_login_duplicado_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
+    """
+    Bug real encontrado: 'Alice' e 'alice' conseguiam logar ao mesmo
+    tempo como usuários diferentes — e /priv alice só encontrava o que
+    tivesse EXATAMENTE esse case. Complementa o teste equivalente em
+    tests/test_modelos.py, mas aqui de ponta a ponta com sockets reais.
+    """
+    porta, _registro = servidor_rodando
+    c1 = ClienteDeTeste(porta)
+    c1.enviar(protocolo.msg_login("Alice"))
+    assert c1.receber()["tipo"] == "login_ok"
+
+    c2 = ClienteDeTeste(porta)
+    c2.enviar(protocolo.msg_login("alice"))  # mesmo nome, case diferente
+    resposta = c2.receber()
+    assert resposta["tipo"] == "login_erro"
+
+    c2.enviar(protocolo.msg_login("alice2"))
+    assert c2.receber()["tipo"] == "login_ok"
+
+    c1.fechar()
+    c2.fechar()
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +661,57 @@ def test_entrar_na_mesma_sala_que_ja_esta_e_no_op_com_aviso():
         sock_servidor.close()
 
 
+def test_entrar_sala_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
+    """
+    Bug real encontrado (parecido com o do nome de usuário): 'Jogos' e
+    'jogos' eram tratadas como salas DIFERENTES — dois clientes que
+    combinam de se encontrar na "mesma" sala, mas digitam o nome com
+    capitalização diferente, ficavam cada um sozinho, sem ver o outro,
+    sem nenhum erro ou aviso.
+    """
+    porta, registro = servidor_rodando
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+
+    bob.enviar(protocolo.msg_entrar_sala("Jogos"))  # com maiuscula
+    bob.receber()  # confirmação
+
+    carol = ClienteDeTeste(porta)
+    carol.enviar(protocolo.msg_login("carol"))
+    assert carol.receber()["tipo"] == "login_ok"
+
+    carol.enviar(protocolo.msg_entrar_sala("jogos"))  # minusculo -- mesma sala?
+    carol.receber()  # confirmação
+    # se caiu na mesma sala, bob deve ver a notificação de entrada da carol
+    assert bob.receber() == {"tipo": "notificacao", "texto": "carol entrou na sala"}
+
+    # e uma mensagem geral de bob deve chegar até a carol
+    bob.enviar(protocolo.msg_mensagem_geral_enviar("oi da sala jogos"))
+    assert carol.receber() == {
+        "tipo": "mensagem_geral", "remetente": "bob", "texto": "oi da sala jogos"
+    }
+
+    assert registro.buscar("bob").sala_atual == registro.buscar("carol").sala_atual == "jogos"
+
+    bob.fechar()
+    carol.fechar()
+
+
+def test_entrar_sala_muito_longa_e_rejeitada(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar(protocolo.msg_entrar_sala("x" * 100))
+    resposta = alice.receber()
+    assert resposta["tipo"] == "erro"
+    assert "longo" in resposta["motivo"]
+
+    alice.fechar()
+
+
 def test_entrar_sala_campo_invalido(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
@@ -986,3 +1121,38 @@ def test_main_trata_keyboardinterrupt_sem_propagar(monkeypatch, capsys):
 
     saida = capsys.readouterr().out
     assert "Encerrando servidor" in saida
+
+
+# --------------------------------------------------------------------------
+# Utilitários de saída no terminal (cores, horário, formatação de endereço)
+# --------------------------------------------------------------------------
+
+def test_c_aplica_cor_quando_habilitada(monkeypatch):
+    """
+    _USAR_COR é sempre False sob pytest (stdout não é um tty de verdade),
+    então o ramo "aplica cor" de _c() nunca é exercitado nos outros
+    testes — força aqui para confirmar que, quando habilitado, o texto
+    vem envolvido pelo código ANSI certo.
+    """
+    monkeypatch.setattr(servidor, "_USAR_COR", True)
+    resultado = servidor._c("oi", servidor._Cor.VERDE)
+    assert resultado == f"{servidor._Cor.VERDE}oi{servidor._Cor.RESET}"
+
+
+def test_c_nao_aplica_cor_quando_desabilitada():
+    resultado = servidor._c("oi", servidor._Cor.VERDE)
+    assert resultado == "oi"  # sem nenhum código ANSI
+
+
+def test_formatar_endereco_tupla_normal():
+    assert servidor._formatar_endereco(("127.0.0.1", 5000)) == "127.0.0.1:5000"
+
+
+def test_formatar_endereco_valor_inesperado_nao_quebra():
+    """
+    Se por algum motivo `endereco` não for a tupla (ip, porta) esperada
+    (ex: None, ou um tipo sem indexação), _formatar_endereco não deve
+    lançar exceção — só cair no repr bruto como último recurso.
+    """
+    assert servidor._formatar_endereco(None) == "None"
+    assert servidor._formatar_endereco(42) == "42"

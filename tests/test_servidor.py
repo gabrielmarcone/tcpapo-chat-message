@@ -303,29 +303,355 @@ def test_mensagem_malformada_recebe_erro_mas_conexao_continua(servidor_rodando):
     # só que "algum erro" veio de volta)
     alice.enviar(protocolo.msg_listar_usuarios())
     resposta_seguinte = alice.receber()
-    assert resposta_seguinte["tipo"] == "erro"
-    assert "nao implementado" in resposta_seguinte["motivo"]
+    assert resposta_seguinte == {"tipo": "lista_usuarios", "usuarios": [{"nome": "alice", "sala": "geral"}]}
 
     alice.fechar()
 
 
-def test_recursos_ainda_nao_implementados_respondem_erro_explicito(servidor_rodando):
+# --------------------------------------------------------------------------
+# Mensagem privada (etapa 6)
+# --------------------------------------------------------------------------
+
+def test_mensagem_privada_chega_ao_destinatario_correto(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
     alice.enviar(protocolo.msg_login("alice"))
     assert alice.receber()["tipo"] == "login_ok"
 
-    for msg in (
-        protocolo.msg_mensagem_privada_enviar("bob", "oi"),
-        protocolo.msg_entrar_sala("jogos"),
-        protocolo.msg_sair_sala(),
-        protocolo.msg_listar_usuarios(),
-    ):
-        alice.enviar(msg)
-        resposta = alice.receber()
-        assert resposta["tipo"] == "erro"
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"  # bob entrou
+
+    alice.enviar(protocolo.msg_mensagem_privada_enviar("bob", "oi em particular"))
+    recebido = bob.receber()
+    assert recebido == {"tipo": "mensagem_privada", "remetente": "alice", "texto": "oi em particular"}
 
     alice.fechar()
+    bob.fechar()
+
+
+def test_mensagem_privada_nao_vaza_para_terceiros(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"
+
+    carol = ClienteDeTeste(porta)
+    carol.enviar(protocolo.msg_login("carol"))
+    assert carol.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"  # carol entrou
+    assert bob.receber()["tipo"] == "notificacao"
+
+    alice.enviar(protocolo.msg_mensagem_privada_enviar("bob", "so pra voce, bob"))
+    assert bob.receber() == {"tipo": "mensagem_privada", "remetente": "alice", "texto": "so pra voce, bob"}
+
+    # carol NAO deve receber nada
+    carol.sock.settimeout(0.3)
+    with pytest.raises(socket.timeout):
+        carol.receber()
+
+    alice.fechar()
+    bob.fechar()
+    carol.fechar()
+
+
+def test_mensagem_privada_independe_de_sala(servidor_rodando):
+    porta, registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"
+
+    bob.enviar(protocolo.msg_entrar_sala("jogos"))
+    bob.receber()  # confirmação "voce entrou na sala 'jogos'"
+    assert alice.receber()["tipo"] == "notificacao"  # "bob saiu da sala" (geral)
+
+    # mesmo em salas diferentes, a privada deve chegar normalmente
+    alice.enviar(protocolo.msg_mensagem_privada_enviar("bob", "mensagem entre salas"))
+    assert bob.receber() == {"tipo": "mensagem_privada", "remetente": "alice", "texto": "mensagem entre salas"}
+
+    alice.fechar()
+    bob.fechar()
+
+
+def test_mensagem_privada_destinatario_inexistente_recebe_erro(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar(protocolo.msg_mensagem_privada_enviar("fantasma", "oi"))
+    resposta = alice.receber()
+    assert resposta["tipo"] == "erro"
+    assert "fantasma" in resposta["motivo"]
+
+    alice.fechar()
+
+
+def test_mensagem_privada_campo_destinatario_invalido(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar({"tipo": "mensagem_privada", "destinatario": "", "texto": "oi"})
+    resposta = alice.receber()
+    assert resposta["tipo"] == "erro"
+    assert "destinatario" in resposta["motivo"]
+
+    alice.fechar()
+
+
+def test_mensagem_privada_com_destinatario_quebrado_nao_propaga_erro():
+    """
+    Cobre _enviar_seguro_para_cliente isolando uma falha de envio — se o
+    destinatário de uma mensagem privada tiver o socket quebrado no
+    exato momento do envio (ex: caiu um instante atrás), a falha deve
+    ser isolada e não deve propagar para quem está enviando (o remetente
+    nem fica sabendo; a remoção do destinatário quebrado é feita pela
+    própria thread dele, seção 9 da Especificação).
+    """
+    registro = RegistroClientes()
+
+    sock_quebrado = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock_quebrado.close()
+    destinatario_quebrado = Cliente(nome="quebrado", sock=sock_quebrado, endereco=("127.0.0.1", 0))
+    registro.adicionar(destinatario_quebrado)
+
+    sock_remetente = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    remetente = Cliente(nome="remetente", sock=sock_remetente, endereco=("127.0.0.1", 0))
+    registro.adicionar(remetente)
+
+    msg = protocolo.msg_mensagem_privada_enviar("quebrado", "oi")
+    continuar = servidor._rotear_mensagem(registro, remetente, msg)  # não deve lançar
+
+    assert continuar is True
+
+
+# --------------------------------------------------------------------------
+# Salas (etapa 7)
+# --------------------------------------------------------------------------
+
+def test_entrar_sala_move_o_cliente_e_notifica_as_duas_salas(servidor_rodando):
+    porta, registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"  # bob entrou no chat (sala geral)
+
+    bob.enviar(protocolo.msg_entrar_sala("jogos"))
+
+    # bob recebe a confirmação direta
+    confirmacao = bob.receber()
+    assert confirmacao == {"tipo": "notificacao", "texto": "voce entrou na sala 'jogos'"}
+
+    # alice (que ficou em "geral") recebe a notificação de saída de bob
+    assert alice.receber() == {"tipo": "notificacao", "texto": "bob saiu da sala"}
+
+    assert registro.buscar("bob").sala_atual == "jogos"
+
+    alice.fechar()
+    bob.fechar()
+
+
+def test_entrar_sala_notifica_quem_ja_estava_na_sala_nova_mas_nao_o_proprio():
+    """
+    Precisa de 3 clientes: um já na sala "jogos" antes de bob entrar, para
+    confirmar que ele recebe a notificação de entrada de bob — e que o
+    próprio bob NÃO recebe a própria notificação de volta (só a
+    confirmação direta, testada no caso acima).
+    """
+    registro = RegistroClientes()
+    sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
+    porta = sock_servidor.getsockname()[1]
+    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro), daemon=True)
+    thread.start()
+
+    try:
+        carol = ClienteDeTeste(porta)
+        carol.enviar(protocolo.msg_login("carol"))
+        assert carol.receber()["tipo"] == "login_ok"
+        carol.enviar(protocolo.msg_entrar_sala("jogos"))
+        assert carol.receber()["tipo"] == "notificacao"  # confirmação própria
+
+        bob = ClienteDeTeste(porta)
+        bob.enviar(protocolo.msg_login("bob"))
+        assert bob.receber()["tipo"] == "login_ok"
+
+        bob.enviar(protocolo.msg_entrar_sala("jogos"))
+        assert bob.receber() == {"tipo": "notificacao", "texto": "voce entrou na sala 'jogos'"}
+
+        # carol (ja estava em "jogos") ve bob entrando
+        assert carol.receber() == {"tipo": "notificacao", "texto": "bob entrou na sala"}
+
+        # bob NAO deve ver a propria notificacao de entrada de novo
+        bob.sock.settimeout(0.3)
+        with pytest.raises(socket.timeout):
+            bob.receber()
+
+        carol.fechar()
+        bob.fechar()
+    finally:
+        sock_servidor.close()
+
+
+def test_sair_sala_volta_para_geral_reaproveitando_o_mesmo_mecanismo(servidor_rodando):
+    porta, registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar(protocolo.msg_entrar_sala("jogos"))
+    assert alice.receber()["tipo"] == "notificacao"
+    assert registro.buscar("alice").sala_atual == "jogos"
+
+    alice.enviar(protocolo.msg_sair_sala())
+    confirmacao = alice.receber()
+    assert confirmacao == {"tipo": "notificacao", "texto": "voce entrou na sala 'geral'"}
+    assert registro.buscar("alice").sala_atual == "geral"
+
+    alice.fechar()
+
+
+def test_entrar_na_mesma_sala_que_ja_esta_e_no_op_com_aviso():
+    registro = RegistroClientes()
+    sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
+    porta = sock_servidor.getsockname()[1]
+    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro), daemon=True)
+    thread.start()
+
+    try:
+        alice = ClienteDeTeste(porta)
+        alice.enviar(protocolo.msg_login("alice"))
+        assert alice.receber()["tipo"] == "login_ok"
+
+        # alice ja esta em "geral" por padrao
+        alice.enviar(protocolo.msg_entrar_sala("geral"))
+        resposta = alice.receber()
+        assert resposta == {"tipo": "notificacao", "texto": "voce ja esta na sala 'geral'"}
+
+        # nao deve ter disparado nenhum broadcast de saida/entrada (nao ha
+        # mais nada na fila alem do aviso acima)
+        alice.sock.settimeout(0.3)
+        with pytest.raises(socket.timeout):
+            alice.receber()
+
+        alice.fechar()
+    finally:
+        sock_servidor.close()
+
+
+def test_entrar_sala_campo_invalido(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar({"tipo": "entrar_sala", "sala": ""})
+    resposta = alice.receber()
+    assert resposta["tipo"] == "erro"
+    assert "sala" in resposta["motivo"]
+
+    alice.fechar()
+
+
+def test_mensagem_geral_apos_trocar_de_sala_vai_para_a_sala_nova(servidor_rodando):
+    porta, registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"
+
+    alice.enviar(protocolo.msg_entrar_sala("jogos"))
+    assert alice.receber()["tipo"] == "notificacao"  # confirmação
+    assert bob.receber() == {"tipo": "notificacao", "texto": "alice saiu da sala"}
+
+    # bob (ainda em "geral") manda mensagem geral -- alice (agora em
+    # "jogos") NAO deve receber
+    bob.enviar(protocolo.msg_mensagem_geral_enviar("oi geral"))
+    alice.sock.settimeout(0.3)
+    with pytest.raises(socket.timeout):
+        alice.receber()
+
+    alice.fechar()
+    bob.fechar()
+
+
+# --------------------------------------------------------------------------
+# Listagem de usuários (etapa 8)
+# --------------------------------------------------------------------------
+
+def test_listar_usuarios_mostra_todos_com_sala_correta(servidor_rodando):
+    porta, registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"
+
+    bob.enviar(protocolo.msg_entrar_sala("jogos"))
+    bob.receber()
+    assert alice.receber()["tipo"] == "notificacao"
+
+    alice.enviar(protocolo.msg_listar_usuarios())
+    resposta = alice.receber()
+    assert resposta["tipo"] == "lista_usuarios"
+    usuarios_ordenados = sorted(resposta["usuarios"], key=lambda u: u["nome"])
+    assert usuarios_ordenados == [
+        {"nome": "alice", "sala": "geral"},
+        {"nome": "bob", "sala": "jogos"},
+    ]
+
+    alice.fechar()
+    bob.fechar()
+
+
+def test_listar_usuarios_funciona_de_qualquer_sala(servidor_rodando):
+    """
+    Requisito da Especificação (seção 7): listagem mostra TODOS os
+    conectados, não só os da sala de quem perguntou.
+    """
+    porta, registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar(protocolo.msg_entrar_sala("jogos"))
+    alice.receber()  # confirmação
+
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+
+    # alice (em "jogos") pede a lista -- deve incluir bob (em "geral") também
+    alice.enviar(protocolo.msg_listar_usuarios())
+    resposta = alice.receber()
+    nomes = {u["nome"] for u in resposta["usuarios"]}
+    assert nomes == {"alice", "bob"}
+
+    alice.fechar()
+    bob.fechar()
 
 
 def test_mensagem_malformada_durante_a_fase_de_login(servidor_rodando):

@@ -54,6 +54,23 @@ class Cliente:
         self.socket = sock
         self.endereco = endereco
         self.sala_atual = sala_atual
+        # Lock de envio DESTE cliente especificamente (não confundir com o
+        # lock global de RegistroClientes, que protege o dicionário de
+        # clientes, não o conteúdo dos sockets).
+        #
+        # Necessário porque, uma vez que o cliente está registrado,
+        # MÚLTIPLAS threads podem escrever no mesmo socket ao mesmo tempo:
+        # a própria thread dele (respostas diretas) e qualquer outra
+        # thread (broadcast, notificação de sala, mensagem privada de
+        # outro cliente). socket.sendall() NÃO é atômico entre chamadas
+        # concorrentes de threads diferentes para o MESMO socket —
+        # confirmado por teste de estresse: sem este lock, mensagens
+        # grandes o suficiente para exigir mais de um send() interno
+        # podem ter seus bytes intercalados entre duas threads
+        # diferentes, corrompendo o framing do protocolo. Quem for
+        # escrever no socket de um Cliente (servidor.py) deve sempre
+        # segurar este lock antes.
+        self.lock_envio = threading.Lock()
 
     def __repr__(self) -> str:
         return (

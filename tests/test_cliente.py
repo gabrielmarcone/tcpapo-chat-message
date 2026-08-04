@@ -152,6 +152,46 @@ class TestParseComandoSairSala(unittest.TestCase):
         self.assertIsNone(msg)
 
 
+class TestParseComandoHistorico(unittest.TestCase):
+    """/historico [quantidade] — persistência de histórico de mensagens."""
+
+    def test_historico_sem_argumento_usa_padrao_do_servidor(self):
+        acao, msg = cliente_app.parse_comando("/historico")
+        self.assertEqual(acao, cliente_app.ACAO_ENVIAR)
+        self.assertEqual(msg, protocolo.msg_historico())
+        self.assertNotIn("limite", msg)  # servidor decide o padrao, cliente nao envia nada
+
+    def test_historico_com_quantidade_valida(self):
+        acao, msg = cliente_app.parse_comando("/historico 10")
+        self.assertEqual(acao, cliente_app.ACAO_ENVIAR)
+        self.assertEqual(msg, protocolo.msg_historico(10))
+
+    def test_historico_case_insensitive_no_nome_do_comando(self):
+        acao, msg = cliente_app.parse_comando("/HISTORICO 5")
+        self.assertEqual(acao, cliente_app.ACAO_ENVIAR)
+        self.assertEqual(msg, protocolo.msg_historico(5))
+
+    def test_historico_com_quantidade_zero_e_invalido(self):
+        acao, msg = cliente_app.parse_comando("/historico 0")
+        self.assertEqual(acao, cliente_app.ACAO_INVALIDO)
+        self.assertIsNone(msg)
+
+    def test_historico_com_quantidade_negativa_e_invalido(self):
+        acao, msg = cliente_app.parse_comando("/historico -5")
+        self.assertEqual(acao, cliente_app.ACAO_INVALIDO)
+        self.assertIsNone(msg)
+
+    def test_historico_com_texto_nao_numerico_e_invalido(self):
+        acao, msg = cliente_app.parse_comando("/historico geral")
+        self.assertEqual(acao, cliente_app.ACAO_INVALIDO)
+        self.assertIsNone(msg)
+
+    def test_historico_com_quantidade_decimal_e_invalido(self):
+        acao, msg = cliente_app.parse_comando("/historico 5.5")
+        self.assertEqual(acao, cliente_app.ACAO_INVALIDO)
+        self.assertIsNone(msg)
+
+
 class TestParseComandoSair(unittest.TestCase):
     """Item 24: /sair."""
 

@@ -80,7 +80,7 @@ Uso típico do framing, dentro do loop de leitura de uma conexão:
 """
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 ENCODING = "utf-8"
 
@@ -130,6 +130,7 @@ TIPO_LISTAR_USUARIOS = "listar_usuarios"
 TIPO_ENTRAR_SALA = "entrar_sala"
 TIPO_SAIR_SALA = "sair_sala"
 TIPO_SAIR = "sair"
+TIPO_HISTORICO = "historico"
 
 # Servidor -> Cliente
 TIPO_LOGIN_OK = "login_ok"
@@ -137,6 +138,7 @@ TIPO_LOGIN_ERRO = "login_erro"
 TIPO_LISTA_USUARIOS = "lista_usuarios"
 TIPO_NOTIFICACAO = "notificacao"
 TIPO_ERRO = "erro"
+TIPO_HISTORICO_RESPOSTA = "historico_resposta"
 
 # TIPO_MENSAGEM_GERAL e TIPO_MENSAGEM_PRIVADA são reutilizados nos dois
 # sentidos (seção 8.3, observação de design) — o que muda é o conjunto de
@@ -296,6 +298,23 @@ def msg_sair() -> dict:
     return {"tipo": TIPO_SAIR}
 
 
+def msg_historico(limite: Optional[int] = None) -> dict:
+    """
+    Pede o histórico recente de mensagens gerais da SALA ATUAL do
+    remetente — mesmo princípio de mensagem_geral (seção 8.3): quem
+    decide o escopo é o servidor, a partir do estado interno dele, não
+    um dado que o cliente escolhe e manda junto.
+
+    `limite` é opcional; se omitido, o servidor aplica um padrão
+    razoável (e também um teto máximo, para não permitir pedir a tabela
+    inteira de uma vez).
+    """
+    mensagem = {"tipo": TIPO_HISTORICO}
+    if limite is not None:
+        mensagem["limite"] = limite
+    return mensagem
+
+
 # --- Servidor -> Cliente ---
 
 def msg_login_ok(nome: str) -> dict:
@@ -331,6 +350,17 @@ def msg_lista_usuarios(usuarios: list) -> dict:
         "tipo": TIPO_LISTA_USUARIOS,
         "usuarios": [{"nome": nome, "sala": sala} for nome, sala in usuarios],
     }
+
+
+def msg_historico_resposta(sala: str, mensagens: list) -> dict:
+    """
+    `mensagens`: lista de dicts já no formato final de exibição, cada um
+    com "remetente", "texto" e "hora" (string já formatada, ex:
+    "14:32:05") — o servidor formata a hora, o cliente só exibe, mesmo
+    princípio de "servidor decide, cliente exibe" usado no resto do
+    protocolo. Vem em ordem cronológica (mais antiga primeiro).
+    """
+    return {"tipo": TIPO_HISTORICO_RESPOSTA, "sala": sala, "mensagens": mensagens}
 
 
 def msg_erro(motivo: str) -> dict:

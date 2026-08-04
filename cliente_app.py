@@ -142,12 +142,38 @@ def conectar(ip: str, porta: int) -> socket.socket:
 # da resposta de login) e thread_recepcao() (todo o resto), para o
 # usuário ver a mensagem formatada da mesma forma nos dois casos.
 
-def imprimir_mensagem(msg: dict) -> None:
+class EstadoCliente:
+    """
+    Estado local do cliente, compartilhado entre a thread principal (que
+    envia comandos) e a thread de recepção (que exibe mensagens). Hoje
+    guarda só a sala atual.
+
+    Necessário porque o protocolo NÃO inclui o nome da sala na mensagem
+    mensagem_geral (decisão da Especificação, seção 8.3: o servidor
+    decide o escopo do broadcast a partir do estado interno dele, sem
+    expor isso no dado da mensagem) — então, sem rastrear isso aqui, o
+    cliente não tinha como saber de qual sala veio uma mensagem geral
+    recebida, e sempre mostrava "[geral]" mesmo depois de /entrar em
+    outra sala (bug real observado em teste manual).
+
+    Atualizado de forma OTIMISTA em main(), logo após enviar /entrar ou
+    /sair_sala com sucesso — sem esperar confirmação do servidor. Isso é
+    seguro porque o servidor sempre aceita esses comandos quando o campo
+    já foi validado no cliente (a única exceção — pedir para entrar na
+    sala em que já está — ainda deixa o cliente na MESMA sala, então a
+    atualização otimista continua correta nesse caso também).
+    """
+
+    def __init__(self):
+        self.sala_atual = "geral"
+
+
+def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
     """Formata e imprime na tela uma mensagem já desserializada do servidor."""
     tipo = msg.get("tipo")
 
     if tipo == protocolo.TIPO_MENSAGEM_GERAL:
-        print(f"[geral] {msg.get('remetente', '?')}: {msg.get('texto', '')}")
+        print(f"[{estado.sala_atual}] {msg.get('remetente', '?')}: {msg.get('texto', '')}")
     elif tipo == protocolo.TIPO_MENSAGEM_PRIVADA:
         print(f"[privado de {msg.get('remetente', '?')}] {msg.get('texto', '')}")
     elif tipo == protocolo.TIPO_NOTIFICACAO:
@@ -251,7 +277,11 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
                         break
                     # Mensagem que não é resposta de login (situação incomum,
                     # mas o framing permite): só exibimos e seguimos esperando.
-                    imprimir_mensagem(msg)
+                    # EstadoCliente() novo aqui (não o de main()) é
+                    # correto de propósito: antes do login terminar, o
+                    # cliente nunca teve chance de mudar de sala, então
+                    # "geral" (o padrão) é sempre a resposta certa.
+                    imprimir_mensagem(msg, EstadoCliente())
 
             if resposta["tipo"] == protocolo.TIPO_LOGIN_OK:
                 print(f"[ok] login bem-sucedido como '{resposta['nome']}'.")
@@ -302,6 +332,7 @@ def thread_recepcao(
     sock: socket.socket,
     buffer_inicial: bytes,
     evento_encerrando: threading.Event,
+    estado: EstadoCliente,
 ) -> None:
     """
     Roda em thread separada. Só faz três coisas, nesta ordem, em loop:
@@ -355,7 +386,7 @@ def thread_recepcao(
             continue
 
         for msg in mensagens:
-            imprimir_mensagem(msg)
+            imprimir_mensagem(msg, estado)
 
     evento_encerrando.set()
 
@@ -562,9 +593,10 @@ def main() -> None:
         nome, buffer_inicial = realizar_login(sock)
 
         evento_encerrando = threading.Event()
+        estado = EstadoCliente()
         thread = threading.Thread(
             target=thread_recepcao,
-            args=(sock, buffer_inicial, evento_encerrando),
+            args=(sock, buffer_inicial, evento_encerrando, estado),
             daemon=True,
         )
         thread.start()
@@ -602,6 +634,14 @@ def main() -> None:
                 # de forma limpa assim que um envio falha de verdade.
                 print("[info] encerrando devido a falha no envio.")
                 break
+
+            # Atualização otimista da sala local (ver EstadoCliente) —
+            # feita só depois do envio ter sucesso, e só para os dois
+            # comandos que realmente mudam de sala.
+            if mensagem["tipo"] == protocolo.TIPO_ENTRAR_SALA:
+                estado.sala_atual = mensagem["sala"]
+            elif mensagem["tipo"] == protocolo.TIPO_SAIR_SALA:
+                estado.sala_atual = "geral"
     except KeyboardInterrupt:
         print("\n[info] encerrando (Ctrl+C)...")
     finally:

@@ -40,9 +40,9 @@ para referência de ambos:
        resistente a mudança futura de ordem ou adição de campo — quem
        consome não precisa saber de cor que o índice 0 é nome.
 
-    5. Tolerância a "\\r\\n" (residual de CRLF) mantida explicitamente
+    5. Tolerância a "\r\n" (residual de CRLF) mantida explicitamente
        (Dev A), mesmo que testes tenham confirmado que json.loads já
-       ignora esse "\\r" como espaço em branco final por conta própria —
+       ignora esse "\r" como espaço em branco final por conta própria —
        é uma linha de código a mais, mas remove qualquer dependência
        desse comportamento não documentado do parser.
 
@@ -268,8 +268,8 @@ def extrair_mensagens(buffer: bytes) -> tuple[list, bytes]:
 
 # --- Cliente -> Servidor ---
 
-def msg_login(nome: str) -> dict:
-    return {"tipo": TIPO_LOGIN, "nome": nome}
+def msg_login(nome: str, senha: str) -> dict:
+    return {"tipo": TIPO_LOGIN, "nome": nome, "senha": senha}
 
 
 def msg_mensagem_geral_enviar(texto: str) -> dict:

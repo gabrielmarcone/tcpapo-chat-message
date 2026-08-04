@@ -66,6 +66,7 @@ from typing import Optional
 import protocolo
 from modelos import Cliente, RegistroClientes
 from persistencia import CAMINHO_BANCO_PADRAO, Historico
+from usuarios import CAMINHO_BANCO_USUARIOS_PADRAO, Usuarios
 
 HOST_PADRAO = "0.0.0.0"
 PORTA_PADRAO = 5000
@@ -307,21 +308,37 @@ def _processar_login(
     sock_cliente: socket.socket,
     endereco,
     registro: RegistroClientes,
+    usuarios: Usuarios,
     buffer: bytes,
 ) -> tuple:
     """
     Loop de login: espera a primeira mensagem válida de tipo 'login' e
-    tenta registrar o nome. Se o nome já estiver em uso (ou for
-    inválido), responde login_erro/erro e CONTINUA esperando — permite
-    nova tentativa sem reconectar (Especificação, seção 5).
+    tenta registrar o nome. Se o nome já estiver em uso, a senha for
+    inválida, ou a autenticação falhar, responde login_erro/erro e
+    CONTINUA esperando — permite nova tentativa sem reconectar
+    (Especificação, seção 5).
 
     Qualquer outro tipo de mensagem recebido antes do login é rejeitado
     com erro, mas não derruba a conexão — o cliente pode tentar de novo.
 
+    Autenticação por senha (nova): depois de validado o formato do nome
+    e da senha, e checado que o nome não está ONLINE agora, a dupla
+    (nome, senha) é conferida em usuarios.autenticar() — que também é
+    responsável por CRIAR o cadastro automaticamente no primeiro login
+    desse nome (não há etapa separada de "criar conta"; decisão de
+    design documentada em usuarios.py).
+
     O registro (RegistroClientes.adicionar), o envio de login_ok, e o
     broadcast de "entrou no chat" acontecem juntos, sob _lock_anuncio —
     ver o comentário da constante para o porquê (bug de ordem de eventos
-    encontrado via teste de estresse).
+    encontrado via teste de estresse). A checagem de "nome já está
+    online" e a autenticação de senha (usuarios.autenticar) também
+    passaram a acontecer dentro do MESMO _lock_anuncio: sem isso, duas
+    conexões logando com o mesmo nome nunca visto antes, ao mesmo tempo,
+    poderiam as duas cair no ramo "cria cadastro" de
+    usuarios.autenticar() sem nunca colidir entre si — o lock serializa
+    a sequência inteira (peek online -> autenticar -> registrar) por
+    conexão.
 
     Retorna (cliente, buffer_restante). `cliente` é None se a conexão foi
     encerrada (recv vazio) antes de um login bem-sucedido.
@@ -378,12 +395,48 @@ def _processar_login(
                 ))
                 continue
 
+            # --- NOVO: validação de formato da senha ---
+            # Mesmo padrão de robustez do campo 'nome' logo acima: campo
+            # ausente/tipo errado não pode nunca chegar a travar o
+            # servidor, e a resposta é sempre login_erro (não 'erro'
+            # genérico) pelo mesmo motivo já documentado para 'nome':
+            # é o único tipo que o loop de retry do cliente sabe tratar.
+            senha = msg.get("senha")
+            if not isinstance(senha, str) or not senha:
+                _enviar(sock_cliente, protocolo.msg_login_erro("campo 'senha' invalido"))
+                continue
+
             cliente = Cliente(nome=nome, sock=sock_cliente, endereco=endereco)
 
             with _lock_anuncio:
-                if not registro.adicionar(cliente):
+                # 1. nome já está ONLINE agora? (JÁ EXISTE, sem mudança
+                #    de comportamento — só adiantado para ANTES da
+                #    checagem de senha, como "peek" sem efeito colateral,
+                #    pra não vazar "essa conta existe/não existe" pra
+                #    quem só está testando se o nome está ocupado)
+                if registro.buscar(nome) is not None:
                     _enviar(sock_cliente, protocolo.msg_login_erro("nome ja em uso"))
-                    continue  # conexão continua aberta — cliente pode tentar outro nome
+                    continue
+
+                # 2. NOVO: nome existe no banco de usuários?
+                #    - não existe -> cria o cadastro com essa senha, ok
+                #    - existe, senha bate -> ok
+                #    - existe, senha não bate -> login_erro "senha incorreta"
+                autenticado, motivo = usuarios.autenticar(nome, senha)
+                if not autenticado:
+                    _enviar(sock_cliente, protocolo.msg_login_erro(motivo))
+                    continue
+
+                # 3. registra de fato (JÁ EXISTE, sem mudança). Continua
+                #    dentro do MESMO _lock_anuncio do passo 1 acima —
+                #    por isso registro.adicionar() aqui sempre deveria
+                #    dar True: nenhuma outra thread pôde ter registrado
+                #    esse nome entre o passo 1 e aqui.
+                if not registro.adicionar(cliente):
+                    # defensivo — não deveria acontecer dado o passo 1,
+                    # mas mantém o protocolo coerente se acontecer.
+                    _enviar(sock_cliente, protocolo.msg_login_erro("nome ja em uso"))
+                    continue
 
                 _enviar(sock_cliente, protocolo.msg_login_ok(nome))
                 _broadcast_sala(
@@ -526,7 +579,8 @@ def _rotear_mensagem(
 # --------------------------------------------------------------------------
 
 def tratar_cliente(
-    sock_cliente: socket.socket, endereco, registro: RegistroClientes, historico: Historico
+    sock_cliente: socket.socket, endereco, registro: RegistroClientes,
+    historico: Historico, usuarios: Usuarios,
 ) -> None:
     """
     Ciclo de vida completo de uma conexão: login, notificação de entrada,
@@ -541,7 +595,7 @@ def tratar_cliente(
     cliente: Optional[Cliente] = None
 
     try:
-        cliente, buffer = _processar_login(sock_cliente, endereco, registro, buffer)
+        cliente, buffer = _processar_login(sock_cliente, endereco, registro, usuarios, buffer)
         if cliente is None:
             return  # desconectou antes de completar o login
 
@@ -640,7 +694,10 @@ def criar_socket_servidor(host: str, porta: int) -> socket.socket:
     return sock
 
 
-def loop_accept(socket_servidor: socket.socket, registro: RegistroClientes, historico: Historico) -> None:
+def loop_accept(
+    socket_servidor: socket.socket, registro: RegistroClientes,
+    historico: Historico, usuarios: Usuarios,
+) -> None:
     """
     Loop principal: aceita conexões e dispara uma thread dedicada para
     cada uma. Nunca bloqueia por mais que TIMEOUT_ACCEPT_SEGUNDOS de cada
@@ -661,7 +718,7 @@ def loop_accept(socket_servidor: socket.socket, registro: RegistroClientes, hist
         print(f"{_prefixo_hora()} {_c('Nova conexao', _Cor.CIANO)}: {_formatar_endereco(endereco)}")
         thread = threading.Thread(
             target=tratar_cliente,
-            args=(sock_cliente, endereco, registro, historico),
+            args=(sock_cliente, endereco, registro, historico, usuarios),
             daemon=True,
         )
         thread.start()
@@ -681,10 +738,17 @@ def main() -> None:
         default=CAMINHO_BANCO_PADRAO,
         help=f"Arquivo SQLite para o historico de mensagens (padrao: {CAMINHO_BANCO_PADRAO})",
     )
+    parser.add_argument(
+        "--banco-usuarios",
+        type=str,
+        default=CAMINHO_BANCO_USUARIOS_PADRAO,
+        help=f"Arquivo SQLite para o cadastro de usuarios (padrao: {CAMINHO_BANCO_USUARIOS_PADRAO})",
+    )
     args = parser.parse_args()
 
     registro = RegistroClientes()
     historico = Historico(args.banco)
+    usuarios = Usuarios(args.banco_usuarios)
 
     try:
         socket_servidor = criar_socket_servidor(HOST_PADRAO, args.porta)
@@ -701,17 +765,19 @@ def main() -> None:
         print(f"{_c('[erro]', _Cor.VERMELHO)} não foi possível iniciar o servidor na porta {args.porta} — já está em uso.")
         print(f"{_c('[dica]', _Cor.CINZA)} tente outra porta (--porta) ou encerre o processo que já está usando essa.")
         historico.fechar()
+        usuarios.fechar()
         sys.exit(1)
 
     print(f"{_prefixo_hora()} {_c('Servidor escutando em', _Cor.VERDE)} {HOST_PADRAO}:{args.porta} (Ctrl+C para encerrar)")
 
     try:
-        loop_accept(socket_servidor, registro, historico)
+        loop_accept(socket_servidor, registro, historico, usuarios)
     except KeyboardInterrupt:
         print(f"\n{_c('Encerrando servidor...', _Cor.AMARELO)}")
     finally:
         socket_servidor.close()
         historico.fechar()
+        usuarios.fechar()
 
 
 if __name__ == "__main__":  # pragma: no cover

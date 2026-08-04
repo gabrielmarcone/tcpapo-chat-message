@@ -282,6 +282,28 @@ def test_desconexao_abrupta_remove_do_registro_e_notifica(servidor_rodando):
     alice.fechar()
 
 
+def test_desconexao_e_registrada_no_console_do_servidor(servidor_rodando, capsys):
+    """
+    Regressão de UX: o servidor já logava 'Nova conexao de (...)' mas não
+    dizia nada quando um cliente desconectava — dificultando acompanhar
+    quem está conectado só olhando o console do servidor.
+    """
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.fechar()
+
+    # dá um instante para a thread do servidor processar a desconexão
+    # e imprimir, antes de checar a saída
+    import time
+    time.sleep(0.2)
+
+    saida = capsys.readouterr().out
+    assert "Conexao encerrada: alice" in saida
+
+
 # --------------------------------------------------------------------------
 # Robustez de protocolo
 # --------------------------------------------------------------------------

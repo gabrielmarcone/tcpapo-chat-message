@@ -446,6 +446,7 @@ def tratar_cliente(sock_cliente: socket.socket, endereco, registro: RegistroClie
                 sock_cliente.close()
             except OSError:
                 pass
+            print(f"Conexao encerrada: {cliente.nome} ({endereco})")
             _broadcast_sala(
                 registro,
                 sala_no_momento_da_saida,
@@ -456,6 +457,7 @@ def tratar_cliente(sock_cliente: socket.socket, endereco, registro: RegistroClie
                 sock_cliente.close()
             except OSError:
                 pass
+            print(f"Conexao encerrada antes do login: {endereco}")
 
 
 # --------------------------------------------------------------------------

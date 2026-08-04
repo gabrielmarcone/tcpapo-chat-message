@@ -65,6 +65,7 @@ from typing import Optional
 
 import protocolo
 from modelos import Cliente, RegistroClientes
+from persistencia import CAMINHO_BANCO_PADRAO, Historico
 
 HOST_PADRAO = "0.0.0.0"
 PORTA_PADRAO = 5000
@@ -433,7 +434,9 @@ def _mudar_sala_do_cliente(registro: RegistroClientes, cliente: Cliente, nova_sa
         _enviar_para_cliente(cliente, protocolo.msg_notificacao(f"voce entrou na sala '{nova_sala}'"))
 
 
-def _rotear_mensagem(registro: RegistroClientes, cliente: Cliente, msg: dict) -> bool:
+def _rotear_mensagem(
+    registro: RegistroClientes, cliente: Cliente, msg: dict, historico: Historico
+) -> bool:
     """
     Processa uma mensagem de um cliente já autenticado.
     Retorna True se o loop de leitura deve continuar, False se deve
@@ -446,6 +449,24 @@ def _rotear_mensagem(registro: RegistroClientes, cliente: Cliente, msg: dict) ->
 
     if tipo == protocolo.TIPO_MENSAGEM_GERAL:
         texto = msg.get("texto", "")
+        # Persistir ANTES do broadcast, não depois — bug real encontrado
+        # via teste de estresse (mesma classe do bug de ordem de anúncio
+        # de login, corrigido antes com _lock_anuncio): como cada cliente
+        # roda numa thread própria, se o remetente A registra DEPOIS de
+        # fazer o broadcast, é possível que o remetente B (respondendo
+        # logo em seguida, já depois de RECEBER a mensagem de A) registre
+        # a mensagem DELE no banco antes de A terminar de registrar a
+        # sua — invertendo a ordem cronológica no histórico, mesmo a
+        # ordem de ENVIO tendo sido correta. Persistir antes do broadcast
+        # garante que, no momento em que o destinatário recebe a
+        # mensagem (e pode decidir responder), a gravação já aconteceu.
+        # Envolvido em try/except: uma falha ao persistir (ex: disco
+        # cheio) não deve impedir a entrega da mensagem ao vivo — só o
+        # histórico fica incompleto, o chat continua funcionando.
+        try:
+            historico.registrar(cliente.sala_atual, cliente.nome, texto)
+        except Exception:
+            pass
         mensagem_repasse = protocolo.msg_mensagem_geral_repassar(cliente.nome, texto)
         _broadcast_sala(registro, cliente.sala_atual, mensagem_repasse, excluir_nome=cliente.nome)
         return True
@@ -490,6 +511,12 @@ def _rotear_mensagem(registro: RegistroClientes, cliente: Cliente, msg: dict) ->
         _enviar_seguro_para_cliente(cliente, protocolo.msg_lista_usuarios(usuarios))
         return True
 
+    if tipo == protocolo.TIPO_HISTORICO:
+        limite = msg.get("limite")  # Historico.buscar_recentes normaliza valor invalido/ausente
+        mensagens = historico.buscar_recentes(cliente.sala_atual, limite)
+        _enviar_seguro_para_cliente(cliente, protocolo.msg_historico_resposta(cliente.sala_atual, mensagens))
+        return True
+
     _enviar_erro_seguro_para_cliente(cliente, f"tipo de mensagem desconhecido: {tipo!r}")
     return True
 
@@ -498,7 +525,9 @@ def _rotear_mensagem(registro: RegistroClientes, cliente: Cliente, msg: dict) ->
 # Ciclo de vida de uma conexão
 # --------------------------------------------------------------------------
 
-def tratar_cliente(sock_cliente: socket.socket, endereco, registro: RegistroClientes) -> None:
+def tratar_cliente(
+    sock_cliente: socket.socket, endereco, registro: RegistroClientes, historico: Historico
+) -> None:
     """
     Ciclo de vida completo de uma conexão: login, notificação de entrada,
     loop de roteamento, e remoção garantida (saída limpa ou abrupta) via
@@ -532,7 +561,7 @@ def tratar_cliente(sock_cliente: socket.socket, endereco, registro: RegistroClie
 
             continuar = True
             for msg in mensagens:
-                continuar = _rotear_mensagem(registro, cliente, msg)
+                continuar = _rotear_mensagem(registro, cliente, msg, historico)
                 if not continuar:
                     break
             if not continuar:
@@ -611,7 +640,7 @@ def criar_socket_servidor(host: str, porta: int) -> socket.socket:
     return sock
 
 
-def loop_accept(socket_servidor: socket.socket, registro: RegistroClientes) -> None:
+def loop_accept(socket_servidor: socket.socket, registro: RegistroClientes, historico: Historico) -> None:
     """
     Loop principal: aceita conexões e dispara uma thread dedicada para
     cada uma. Nunca bloqueia por mais que TIMEOUT_ACCEPT_SEGUNDOS de cada
@@ -632,7 +661,7 @@ def loop_accept(socket_servidor: socket.socket, registro: RegistroClientes) -> N
         print(f"{_prefixo_hora()} {_c('Nova conexao', _Cor.CIANO)}: {_formatar_endereco(endereco)}")
         thread = threading.Thread(
             target=tratar_cliente,
-            args=(sock_cliente, endereco, registro),
+            args=(sock_cliente, endereco, registro, historico),
             daemon=True,
         )
         thread.start()
@@ -646,9 +675,16 @@ def main() -> None:
         default=PORTA_PADRAO,
         help=f"Porta de escuta (padrao: {PORTA_PADRAO})",
     )
+    parser.add_argument(
+        "--banco",
+        type=str,
+        default=CAMINHO_BANCO_PADRAO,
+        help=f"Arquivo SQLite para o historico de mensagens (padrao: {CAMINHO_BANCO_PADRAO})",
+    )
     args = parser.parse_args()
 
     registro = RegistroClientes()
+    historico = Historico(args.banco)
 
     try:
         socket_servidor = criar_socket_servidor(HOST_PADRAO, args.porta)
@@ -664,16 +700,18 @@ def main() -> None:
         # — a dica logo abaixo já diz o que fazer.
         print(f"{_c('[erro]', _Cor.VERMELHO)} não foi possível iniciar o servidor na porta {args.porta} — já está em uso.")
         print(f"{_c('[dica]', _Cor.CINZA)} tente outra porta (--porta) ou encerre o processo que já está usando essa.")
+        historico.fechar()
         sys.exit(1)
 
     print(f"{_prefixo_hora()} {_c('Servidor escutando em', _Cor.VERDE)} {HOST_PADRAO}:{args.porta} (Ctrl+C para encerrar)")
 
     try:
-        loop_accept(socket_servidor, registro)
+        loop_accept(socket_servidor, registro, historico)
     except KeyboardInterrupt:
         print(f"\n{_c('Encerrando servidor...', _Cor.AMARELO)}")
     finally:
         socket_servidor.close()
+        historico.fechar()
 
 
 if __name__ == "__main__":  # pragma: no cover

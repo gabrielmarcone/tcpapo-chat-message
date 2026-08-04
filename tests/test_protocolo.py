@@ -297,6 +297,34 @@ def test_msg_lista_usuarios_formato_com_chaves_nomeadas():
     assert resto == b""
 
 
+def test_msg_historico_sem_limite():
+    assert protocolo.msg_historico() == {"tipo": "historico"}
+
+
+def test_msg_historico_com_limite():
+    assert protocolo.msg_historico(10) == {"tipo": "historico", "limite": 10}
+
+
+def test_msg_historico_resposta_formato():
+    mensagens = [
+        {"remetente": "alice", "texto": "oi", "hora": "14:32:05"},
+        {"remetente": "bob", "texto": "e ai", "hora": "14:33:10"},
+    ]
+    mensagem = protocolo.msg_historico_resposta("geral", mensagens)
+
+    assert mensagem == {
+        "tipo": "historico_resposta",
+        "sala": "geral",
+        "mensagens": mensagens,
+    }
+
+    # round-trip completo de serialização + extração
+    linha = protocolo.serializar(mensagem)
+    mensagens_extraidas, resto = protocolo.extrair_mensagens(linha)
+    assert mensagens_extraidas[0] == mensagem
+    assert resto == b""
+
+
 def test_todas_as_mensagens_construidas_sao_serializaveis():
     """
     Verificação de sanidade: toda função construtora deve produzir algo
@@ -318,6 +346,9 @@ def test_todas_as_mensagens_construidas_sao_serializaveis():
         protocolo.msg_notificacao("texto"),
         protocolo.msg_lista_usuarios([("alice", "geral")]),
         protocolo.msg_erro("motivo"),
+        protocolo.msg_historico(),
+        protocolo.msg_historico(10),
+        protocolo.msg_historico_resposta("geral", [{"remetente": "alice", "texto": "oi", "hora": "14:32:05"}]),
     ]
     for mensagem in construidas:
         protocolo.serializar(mensagem)  # não deve levantar exceção

@@ -254,6 +254,23 @@ def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
                 nome = _c(usuario.get("nome", "?"), _Cor.NEGRITO)
                 sala = usuario.get("sala", "?")
                 print(f"    - {nome} ({sala})")
+    elif tipo == protocolo.TIPO_HISTORICO_RESPOSTA:
+        # Cada item já vem com "hora" formatada pelo servidor (o momento
+        # em que a mensagem foi enviada de verdade, não agora) — por
+        # isso usamos ela em vez de `hora` (que é o instante em que esta
+        # resposta chegou). Indentado com "    " no mesmo padrão do
+        # /lista, para ficar visualmente claro que é um bloco só, e não
+        # mensagens novas chegando ao vivo.
+        sala = msg.get("sala", "?")
+        mensagens_historico = msg.get("mensagens", [])
+        print(f"{hora} {_c('[histórico]', _Cor.CIANO)} sala '{sala}' — {len(mensagens_historico)} mensagem(ns):")
+        if not mensagens_historico:
+            print("    nenhuma mensagem no histórico desta sala ainda.")
+        else:
+            for item in mensagens_historico:
+                hora_item = _c(f"[{item.get('hora', '?')}]", _Cor.CINZA)
+                remetente_item = _c(item.get("remetente", "?"), _Cor.NEGRITO)
+                print(f"    {hora_item} {remetente_item}: {item.get('texto', '')}")
     else:
         # Tipo não tratado ainda (não deveria acontecer, dado o contrato
         # fechado de protocolo.py). Não inventamos formatação para campos
@@ -499,12 +516,14 @@ COMANDO_LISTA = "/lista"
 COMANDO_ENTRAR = "/entrar"
 COMANDO_SAIR_SALA = "/sair_sala"
 COMANDO_SAIR = "/sair"
+COMANDO_HISTORICO = "/historico"
 
 TEXTO_AJUDA_COMANDOS = (
     f"  {COMANDO_PRIV} <usuario> <mensagem>   envia mensagem privada\n"
     f"  {COMANDO_LISTA}                       lista usuários conectados\n"
     f"  {COMANDO_ENTRAR} <sala>               entra em uma sala\n"
     f"  {COMANDO_SAIR_SALA}                   volta para a sala geral\n"
+    f"  {COMANDO_HISTORICO} [quantidade]      mostra mensagens recentes da sala atual\n"
     f"  {COMANDO_SAIR}                        encerra a conexão\n"
     "  <texto livre>                  mensagem para o chat geral"
 )
@@ -580,6 +599,13 @@ def parse_comando(texto: str) -> Tuple[str, Optional[dict]]:
         if resto:
             return _comando_invalido(f"{COMANDO_SAIR_SALA} não aceita argumentos")
         return ACAO_ENVIAR, protocolo.msg_sair_sala()
+
+    if comando == COMANDO_HISTORICO:
+        if not resto:
+            return ACAO_ENVIAR, protocolo.msg_historico()
+        if not resto.isdigit() or int(resto) <= 0:
+            return _comando_invalido(f"{COMANDO_HISTORICO} [quantidade]  (numero inteiro positivo, opcional)")
+        return ACAO_ENVIAR, protocolo.msg_historico(int(resto))
 
     if comando == COMANDO_SAIR:
         if resto:

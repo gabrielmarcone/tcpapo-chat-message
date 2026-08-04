@@ -28,6 +28,7 @@ import pytest
 import protocolo
 import servidor
 from modelos import Cliente, RegistroClientes
+from persistencia import Historico
 
 
 # --------------------------------------------------------------------------
@@ -39,14 +40,22 @@ def servidor_rodando():
     """
     Sobe um servidor real numa porta livre escolhida pelo SO, num thread
     de accept em background. Devolve (porta, registro) para os testes.
+
+    O histórico (persistencia.Historico) é criado e usado internamente
+    (banco em memória, isolado por teste) — a maioria dos testes não
+    precisa acessá-lo diretamente, só precisa que ele exista e funcione;
+    quem precisa testar /historico especificamente monta seu próprio
+    setup manual (ver test_historico_* mais abaixo), igual já era feito
+    para outros cenários que precisam de acesso a mais peças internas.
     """
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
 
     thread_accept = threading.Thread(
         target=servidor.loop_accept,
-        args=(sock_servidor, registro),
+        args=(sock_servidor, registro, historico),
         daemon=True,
     )
     thread_accept.start()
@@ -54,6 +63,7 @@ def servidor_rodando():
     yield porta, registro
 
     sock_servidor.close()
+    historico.fechar()
 
 
 class ClienteDeTeste:
@@ -294,9 +304,10 @@ def test_broadcast_nao_vaza_para_fora_da_sala_do_remetente():
     implementada de verdade.
     """
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
-    thread_accept = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro), daemon=True)
+    thread_accept = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro, historico), daemon=True)
     thread_accept.start()
 
     try:
@@ -323,6 +334,7 @@ def test_broadcast_nao_vaza_para_fora_da_sala_do_remetente():
         bob.fechar()
     finally:
         sock_servidor.close()
+        historico.fechar()
 
 
 # --------------------------------------------------------------------------
@@ -539,7 +551,9 @@ def test_mensagem_privada_com_destinatario_quebrado_nao_propaga_erro():
     registro.adicionar(remetente)
 
     msg = protocolo.msg_mensagem_privada_enviar("quebrado", "oi")
-    continuar = servidor._rotear_mensagem(registro, remetente, msg)  # não deve lançar
+    historico = Historico(":memory:")
+    continuar = servidor._rotear_mensagem(registro, remetente, msg, historico)  # não deve lançar
+    historico.fechar()
 
     assert continuar is True
 
@@ -582,9 +596,10 @@ def test_entrar_sala_notifica_quem_ja_estava_na_sala_nova_mas_nao_o_proprio():
     confirmação direta, testada no caso acima).
     """
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
-    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro), daemon=True)
+    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro, historico), daemon=True)
     thread.start()
 
     try:
@@ -613,6 +628,7 @@ def test_entrar_sala_notifica_quem_ja_estava_na_sala_nova_mas_nao_o_proprio():
         bob.fechar()
     finally:
         sock_servidor.close()
+        historico.fechar()
 
 
 def test_sair_sala_volta_para_geral_reaproveitando_o_mesmo_mecanismo(servidor_rodando):
@@ -635,9 +651,10 @@ def test_sair_sala_volta_para_geral_reaproveitando_o_mesmo_mecanismo(servidor_ro
 
 def test_entrar_na_mesma_sala_que_ja_esta_e_no_op_com_aviso():
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
-    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro), daemon=True)
+    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro, historico), daemon=True)
     thread.start()
 
     try:
@@ -659,6 +676,7 @@ def test_entrar_na_mesma_sala_que_ja_esta_e_no_op_com_aviso():
         alice.fechar()
     finally:
         sock_servidor.close()
+        historico.fechar()
 
 
 def test_entrar_sala_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
@@ -811,6 +829,187 @@ def test_listar_usuarios_funciona_de_qualquer_sala(servidor_rodando):
     bob.fechar()
 
 
+# --------------------------------------------------------------------------
+# Histórico de mensagens (persistência)
+# --------------------------------------------------------------------------
+
+def test_historico_de_sala_vazia_retorna_lista_vazia(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar(protocolo.msg_historico())
+    resposta = alice.receber()
+
+    assert resposta == {"tipo": "historico_resposta", "sala": "geral", "mensagens": []}
+
+    alice.fechar()
+
+
+def test_historico_traz_mensagens_gerais_ja_enviadas(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"  # bob entrou
+
+    alice.enviar(protocolo.msg_mensagem_geral_enviar("primeira mensagem"))
+    bob.receber()  # so pra garantir que o servidor ja processou e persistiu
+    bob.enviar(protocolo.msg_mensagem_geral_enviar("segunda mensagem"))
+    alice.receber()
+
+    alice.enviar(protocolo.msg_historico())
+    resposta = alice.receber()
+
+    assert resposta["tipo"] == "historico_resposta"
+    assert resposta["sala"] == "geral"
+    textos = [m["texto"] for m in resposta["mensagens"]]
+    assert textos == ["primeira mensagem", "segunda mensagem"]  # ordem cronologica
+    assert resposta["mensagens"][0]["remetente"] == "alice"
+    assert resposta["mensagens"][1]["remetente"] == "bob"
+    assert "hora" in resposta["mensagens"][0]
+
+    alice.fechar()
+    bob.fechar()
+
+
+def test_historico_nao_inclui_mensagem_privada(servidor_rodando):
+    """Decisão de design: só mensagem geral é persistida, nunca privada."""
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    bob = ClienteDeTeste(porta)
+    bob.enviar(protocolo.msg_login("bob"))
+    assert bob.receber()["tipo"] == "login_ok"
+    assert alice.receber()["tipo"] == "notificacao"
+
+    alice.enviar(protocolo.msg_mensagem_privada_enviar("bob", "segredo, nao deveria ficar salvo"))
+    bob.receber()
+
+    alice.enviar(protocolo.msg_historico())
+    resposta = alice.receber()
+
+    assert resposta["mensagens"] == []
+
+    alice.fechar()
+    bob.fechar()
+
+
+def test_historico_e_isolado_por_sala(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar(protocolo.msg_mensagem_geral_enviar("mensagem na geral"))
+
+    alice.enviar(protocolo.msg_entrar_sala("jogos"))
+    alice.receber()  # confirmação
+
+    alice.enviar(protocolo.msg_mensagem_geral_enviar("mensagem em jogos"))
+
+    # historico da sala ATUAL (jogos) nao deve trazer a mensagem da geral
+    alice.enviar(protocolo.msg_historico())
+    resposta = alice.receber()
+
+    assert [m["texto"] for m in resposta["mensagens"]] == ["mensagem em jogos"]
+    assert resposta["sala"] == "jogos"
+
+    alice.fechar()
+
+
+def test_historico_respeita_limite_pedido(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    for i in range(5):
+        alice.enviar(protocolo.msg_mensagem_geral_enviar(f"mensagem {i}"))
+
+    alice.enviar(protocolo.msg_historico(limite=2))
+    resposta = alice.receber()
+
+    # as 2 MAIS RECENTES (3 e 4), em ordem cronologica
+    assert [m["texto"] for m in resposta["mensagens"]] == ["mensagem 3", "mensagem 4"]
+
+    alice.fechar()
+
+
+def test_historico_com_limite_invalido_nao_quebra(servidor_rodando):
+    porta, _registro = servidor_rodando
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+
+    alice.enviar(protocolo.msg_mensagem_geral_enviar("oi"))
+
+    # limite negativo, vindo de uma mensagem malformada -- nao deve derrubar a conexao
+    alice.enviar({"tipo": "historico", "limite": -5})
+    resposta = alice.receber()
+
+    assert resposta["tipo"] == "historico_resposta"
+    assert len(resposta["mensagens"]) == 1  # cai no padrao, encontra a unica mensagem que existe
+
+    alice.fechar()
+
+
+class _HistoricoFalsoQueQuebra:
+    """
+    Fake de persistencia.Historico cujo registrar() sempre falha —
+    confirma que uma falha ao persistir (ex: disco cheio, banco
+    corrompido) NÃO impede a entrega ao vivo da mensagem geral. Ver o
+    try/except em _rotear_mensagem.
+    """
+
+    def registrar(self, sala, remetente, texto):
+        raise RuntimeError("falha simulada ao gravar no banco")
+
+    def buscar_recentes(self, sala, limite=None):
+        return []
+
+
+def test_falha_ao_persistir_historico_nao_impede_entrega_da_mensagem_geral():
+    registro = RegistroClientes()
+    historico_falso = _HistoricoFalsoQueQuebra()
+    sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
+    porta = sock_servidor.getsockname()[1]
+    thread = threading.Thread(
+        target=servidor.loop_accept, args=(sock_servidor, registro, historico_falso), daemon=True
+    )
+    thread.start()
+
+    try:
+        alice = ClienteDeTeste(porta)
+        alice.enviar(protocolo.msg_login("alice"))
+        assert alice.receber()["tipo"] == "login_ok"
+
+        bob = ClienteDeTeste(porta)
+        bob.enviar(protocolo.msg_login("bob"))
+        assert bob.receber()["tipo"] == "login_ok"
+        assert alice.receber()["tipo"] == "notificacao"
+
+        alice.enviar(protocolo.msg_mensagem_geral_enviar("oi mesmo com o historico quebrado"))
+        recebido = bob.receber()
+        assert recebido == {
+            "tipo": "mensagem_geral",
+            "remetente": "alice",
+            "texto": "oi mesmo com o historico quebrado",
+        }
+
+        alice.fechar()
+        bob.fechar()
+    finally:
+        sock_servidor.close()
+
+
 def test_mensagem_malformada_durante_a_fase_de_login(servidor_rodando):
     porta, _registro = servidor_rodando
     c = ClienteDeTeste(porta)
@@ -933,20 +1132,24 @@ class _SocketFalsoQueBraNoClose:
 
 def test_tratar_cliente_nao_propaga_erro_se_close_falhar_apos_login():
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     login_bytes = protocolo.serializar(protocolo.msg_login("alice"))
     sair_bytes = protocolo.serializar(protocolo.msg_sair())
     sock_falso = _SocketFalsoQueBraNoClose([login_bytes, sair_bytes])
 
-    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro)  # não deve propagar
+    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico)  # não deve propagar
 
     assert registro.buscar("alice") is None
+    historico.fechar()
 
 
 def test_tratar_cliente_nao_propaga_erro_se_close_falhar_antes_do_login():
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     sock_falso = _SocketFalsoQueBraNoClose([])  # recv já retorna vazio: cliente nunca loga
 
-    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro)  # não deve propagar
+    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico)  # não deve propagar
+    historico.fechar()
 
 
 class _SocketFalsoQueQuebraNoRecv:
@@ -976,15 +1179,17 @@ class _SocketFalsoQueQuebraNoRecv:
 
 def test_tratar_cliente_trata_oserror_abrupto_durante_roteamento_sem_propagar():
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     login_bytes = protocolo.serializar(protocolo.msg_login("alice"))
     sock_falso = _SocketFalsoQueQuebraNoRecv([login_bytes])
 
     # apos o login, o proximo recv() levanta OSError (simulando reset) em
     # vez de retornar b"" -- deve ser tratado pelo except OSError externo,
     # sem propagar, e o cliente deve ser removido do registro do mesmo jeito
-    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro)
+    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico)
 
     assert registro.buscar("alice") is None
+    historico.fechar()
 
 
 # --------------------------------------------------------------------------
@@ -998,10 +1203,12 @@ def test_loop_accept_retorna_se_socket_ja_estiver_fechado():
     sem lançar exceção nem travar.
     """
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     sock_servidor.close()
 
-    servidor.loop_accept(sock_servidor, registro)  # não deve lançar, nem travar
+    servidor.loop_accept(sock_servidor, registro, historico)  # não deve lançar, nem travar
+    historico.fechar()
 
 
 def test_loop_accept_encerra_rapido_mesmo_sem_conexoes_pendentes():
@@ -1015,9 +1222,10 @@ def test_loop_accept_encerra_rapido_mesmo_sem_conexoes_pendentes():
     muito ou nunca acontecer sem uma conexão nova chegar).
     """
     registro = RegistroClientes()
+    historico = Historico(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
 
-    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro), daemon=True)
+    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro, historico), daemon=True)
     thread.start()
     time.sleep(0.05)  # garante que a thread já entrou no loop de accept()
 
@@ -1025,6 +1233,7 @@ def test_loop_accept_encerra_rapido_mesmo_sem_conexoes_pendentes():
     thread.join(timeout=servidor.TIMEOUT_ACCEPT_SEGUNDOS + 1.5)
 
     assert not thread.is_alive()
+    historico.fechar()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="comportamento de SO_REUSEADDR e diferente no Windows")
@@ -1074,11 +1283,11 @@ def test_main_le_porta_via_argumento_e_nao_bloqueia(monkeypatch, capsys):
     """
     recebido = {}
 
-    def loop_accept_fake(sock_servidor, _registro):
+    def loop_accept_fake(sock_servidor, _registro, _historico):
         recebido["porta"] = sock_servidor.getsockname()[1]
 
     monkeypatch.setattr(servidor, "loop_accept", loop_accept_fake)
-    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "0"])
+    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "0", "--banco", ":memory:"])
 
     servidor.main()
 
@@ -1099,7 +1308,7 @@ def test_main_porta_ja_em_uso_mostra_erro_amigavel_sem_traceback(monkeypatch, ca
         raise OSError("[Errno 98] Address already in use")
 
     monkeypatch.setattr(servidor, "criar_socket_servidor", criar_socket_servidor_fake)
-    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "5000"])
+    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "5000", "--banco", ":memory:"])
 
     with pytest.raises(SystemExit) as exc_info:
         servidor.main()
@@ -1111,11 +1320,11 @@ def test_main_porta_ja_em_uso_mostra_erro_amigavel_sem_traceback(monkeypatch, ca
 
 
 def test_main_trata_keyboardinterrupt_sem_propagar(monkeypatch, capsys):
-    def loop_accept_fake(_sock_servidor, _registro):
+    def loop_accept_fake(_sock_servidor, _registro, _historico):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(servidor, "loop_accept", loop_accept_fake)
-    monkeypatch.setattr("sys.argv", ["servidor.py"])
+    monkeypatch.setattr("sys.argv", ["servidor.py", "--banco", ":memory:"])
 
     servidor.main()  # não deve propagar a exceção
 

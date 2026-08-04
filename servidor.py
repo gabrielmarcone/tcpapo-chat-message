@@ -81,6 +81,15 @@ TAMANHO_BUFFER_RECV = 4096
 # nova chegava e liberava o accept().
 TIMEOUT_ACCEPT_SEGUNDOS = 0.5
 
+# Limite de tamanho para nome de usuário e nome de sala — nenhum dos dois
+# tinha limite antes (testado: um nome de 150 caracteres era aceito sem
+# erro), o que não quebra nada tecnicamente, mas distorce a exibição na
+# tela de todo mundo no chat sem necessidade real. Números escolhidos
+# generosos o suficiente para qualquer nome/apelido real, sem serem
+# ilimitados.
+TAMANHO_MAXIMO_NOME = 30
+TAMANHO_MAXIMO_SALA = 30
+
 # Lock que serializa a sequência "mudar estado visível a outros clientes
 # (registrar login, ou trocar de sala) + anunciar via broadcast" em
 # relação a OUTRAS sequências do mesmo tipo rodando em paralelo.
@@ -123,13 +132,13 @@ class _Cor:
 
 _USAR_COR = sys.stdout.isatty()
 
-if sys.platform == "win32" and _USAR_COR:
-    # Em terminais Windows mais antigos (fora do Windows Terminal), o
-    # processamento de sequências ANSI vem desligado por padrão.
-    # os.system("") é um truque conhecido e sem dependência externa que
-    # liga isso pro resto do processo — no Windows Terminal (o que
-    # aparece nos prints do grupo) já vem ligado, então isso é só uma
-    # rede de segurança para outros terminais.
+if sys.platform == "win32" and _USAR_COR:  # pragma: no cover
+    # Só executa em Windows COM terminal de verdade — combinação de
+    # condições que exigiria recarregar o módulo inteiro com
+    # sys.platform e isatty() falsificados para testar de forma limpa.
+    # Truque de compatibilidade de uma linha, de baixo risco; a
+    # cobertura de linha não vale a complexidade de um teste artificial
+    # aqui.
     os.system("")
 
 
@@ -333,7 +342,39 @@ def _processar_login(
 
             nome = msg.get("nome")
             if not isinstance(nome, str) or not nome.strip():
-                _enviar_erro_seguro(sock_cliente, "campo 'nome' invalido")
+                # login_erro (não um 'erro' genérico) de propósito: é o
+                # único tipo de resposta que o loop de login do cliente
+                # sabe tratar re-perguntando o apelido automaticamente
+                # (ver realizar_login em cliente_app.py) — um 'erro'
+                # genérico aqui deixaria o cliente preso esperando
+                # login_ok/login_erro que nunca chegaria (bug real
+                # encontrado ao testar as validações abaixo de ponta a
+                # ponta com o cliente de verdade, não só com sockets
+                # crus simulando o protocolo).
+                _enviar(sock_cliente, protocolo.msg_login_erro("campo 'nome' invalido"))
+                continue
+
+            nome = nome.strip()
+
+            # Bug real encontrado em teste manual: um nome com espaço
+            # (ex: "Joao Pedro") é ambíguo para /priv, que espera
+            # exatamente dois argumentos (destinatário e texto) separados
+            # por espaço — "/priv Joao Pedro oi" era interpretado como
+            # destinatário="Joao", texto="Pedro oi", e "Joao" (sozinho)
+            # nunca existe no registro. Em vez de complicar o parsing do
+            # cliente com aspas/escape, a Especificação implícita mais
+            # simples e robusta é: apelido é sempre uma única palavra.
+            if any(c.isspace() for c in nome):
+                _enviar(sock_cliente, protocolo.msg_login_erro(
+                    "nome nao pode conter espacos (mensagem privada usa o "
+                    "nome como uma unica palavra) — tente algo como 'joao_pedro'"
+                ))
+                continue
+
+            if len(nome) > TAMANHO_MAXIMO_NOME:
+                _enviar(sock_cliente, protocolo.msg_login_erro(
+                    f"nome muito longo (maximo {TAMANHO_MAXIMO_NOME} caracteres)"
+                ))
                 continue
 
             cliente = Cliente(nome=nome, sock=sock_cliente, endereco=endereco)
@@ -431,7 +472,13 @@ def _rotear_mensagem(registro: RegistroClientes, cliente: Cliente, msg: dict) ->
         if not isinstance(sala_pedida, str) or not sala_pedida.strip():
             _enviar_erro_seguro_para_cliente(cliente, "campo 'sala' invalido ou ausente")
             return True
-        _mudar_sala_do_cliente(registro, cliente, sala_pedida.strip())
+        sala_normalizada = sala_pedida.strip().casefold()
+        if len(sala_normalizada) > TAMANHO_MAXIMO_SALA:
+            _enviar_erro_seguro_para_cliente(
+                cliente, f"nome de sala muito longo (maximo {TAMANHO_MAXIMO_SALA} caracteres)"
+            )
+            return True
+        _mudar_sala_do_cliente(registro, cliente, sala_normalizada)
         return True
 
     if tipo == protocolo.TIPO_SAIR_SALA:

@@ -84,23 +84,44 @@ class RegistroClientes:
     Registro central de clientes conectados: dict nome -> Cliente,
     protegido por um único Lock global compartilhado entre todas as
     threads do servidor.
+
+    A CHAVE interna do dicionário é o nome normalizado por
+    `str.casefold()` (não o nome literal) — necessário para que "Alice"
+    e "alice" sejam tratados como o MESMO usuário para fins de unicidade
+    e busca (bug real observado: os dois conseguiam se conectar ao mesmo
+    tempo como pessoas "diferentes", e `/priv alice` não encontrava
+    "Alice" se a busca fosse por igualdade exata de string). O atributo
+    `Cliente.nome` continua guardando o nome com a capitalização
+    ORIGINAL escolhida no login — a normalização é só para comparação
+    interna, nunca para exibição.
+
+    casefold() (não lower()) de propósito: é a forma recomendada pelo
+    Python para comparação sem distinção de maiúsculas/minúsculas
+    Unicode-aware — mais robusta que lower() para nomes com acentos ou
+    caracteres fora do alfabeto ASCII básico.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._clientes: dict[str, Cliente] = {}
+        self._clientes: dict[str, Cliente] = {}  # chave: nome.casefold()
+
+    @staticmethod
+    def _chave(nome: str) -> str:
+        return nome.casefold()
 
     def adicionar(self, cliente: Cliente) -> bool:
         """
-        Adiciona o cliente ao registro, se o nome ainda não estiver em
-        uso. Retorna True se adicionou, False se o nome já existia (login
+        Adiciona o cliente ao registro, se o nome (comparado sem
+        distinção de maiúsculas/minúsculas) ainda não estiver em uso.
+        Retorna True se adicionou, False se o nome já existia (login
         duplicado) — quem chama decide o que fazer com False (ex:
         responder login_erro sem fechar a conexão).
         """
         with self._lock:
-            if cliente.nome in self._clientes:
+            chave = self._chave(cliente.nome)
+            if chave in self._clientes:
                 return False
-            self._clientes[cliente.nome] = cliente
+            self._clientes[chave] = cliente
             return True
 
     def remover(self, nome: str) -> None:
@@ -112,17 +133,18 @@ class RegistroClientes:
         dessas duas vias vá disparar.
         """
         with self._lock:
-            self._clientes.pop(nome, None)
+            self._clientes.pop(self._chave(nome), None)
 
     def buscar(self, nome: str) -> Optional[Cliente]:
         """
-        Retorna o objeto Cliente associado a `nome`, ou None se não
-        existir. Devolve a referência viva (não uma cópia) — ver nota de
+        Retorna o objeto Cliente associado a `nome` (comparado sem
+        distinção de maiúsculas/minúsculas), ou None se não existir.
+        Devolve a referência viva (não uma cópia) — ver nota de
         concorrência no topo do arquivo sobre por que sala_atual não deve
         ser mutado diretamente a partir do resultado deste método.
         """
         with self._lock:
-            return self._clientes.get(nome)
+            return self._clientes.get(self._chave(nome))
 
     def mudar_sala(self, nome: str, nova_sala: str) -> bool:
         """
@@ -133,7 +155,7 @@ class RegistroClientes:
         comando e o momento em que tentou aplicar a troca de sala.
         """
         with self._lock:
-            cliente = self._clientes.get(nome)
+            cliente = self._clientes.get(self._chave(nome))
             if cliente is None:
                 return False
             cliente.sala_atual = nova_sala

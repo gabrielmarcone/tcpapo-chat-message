@@ -56,9 +56,11 @@ Decisões de design tomadas aqui (vale registrar no relatório):
 """
 
 import argparse
+import os
 import socket
 import sys
 import threading
+from datetime import datetime
 from typing import Optional
 
 import protocolo
@@ -100,6 +102,60 @@ TIMEOUT_ACCEPT_SEGUNDOS = 0.5
 # login (que pode demorar indefinidamente) — travar nisso prenderia todo
 # mundo atrás de quem está mais lento para digitar o nome.
 _lock_anuncio = threading.Lock()
+
+
+# --------------------------------------------------------------------------
+# Saída no terminal — só cosmético (seção nova, a pedido, para deixar o
+# console do servidor mais legível). NÃO afeta protocolo, rede, nem os
+# testes: as cores só são aplicadas quando a saída é um terminal de
+# verdade (sys.stdout.isatty()) — capturada por teste ou redirecionada
+# para arquivo, sai como texto puro, sem nenhuma sequência ANSI no meio.
+# --------------------------------------------------------------------------
+
+class _Cor:
+    RESET = "\033[0m"
+    CINZA = "\033[90m"
+    VERDE = "\033[92m"
+    AMARELO = "\033[93m"
+    VERMELHO = "\033[91m"
+    CIANO = "\033[96m"
+
+
+_USAR_COR = sys.stdout.isatty()
+
+if sys.platform == "win32" and _USAR_COR:
+    # Em terminais Windows mais antigos (fora do Windows Terminal), o
+    # processamento de sequências ANSI vem desligado por padrão.
+    # os.system("") é um truque conhecido e sem dependência externa que
+    # liga isso pro resto do processo — no Windows Terminal (o que
+    # aparece nos prints do grupo) já vem ligado, então isso é só uma
+    # rede de segurança para outros terminais.
+    os.system("")
+
+
+def _c(texto: str, cor: str) -> str:
+    """Aplica `cor` a `texto` só se a saída for um terminal de verdade."""
+    if not _USAR_COR:
+        return texto
+    return f"{cor}{texto}{_Cor.RESET}"
+
+
+def _hora() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _prefixo_hora() -> str:
+    return _c(f"[{_hora()}]", _Cor.CINZA)
+
+
+def _formatar_endereco(endereco) -> str:
+    """('127.0.0.1', 53472) -> '127.0.0.1:53472' — mais legível que o
+    repr de tupla cru (que ficava tipo '(('127.0.0.1', 53472))' quando
+    combinado com outro parêntese ao redor)."""
+    try:
+        return f"{endereco[0]}:{endereco[1]}"
+    except (TypeError, IndexError):
+        return str(endereco)
 
 
 # --------------------------------------------------------------------------
@@ -446,7 +502,7 @@ def tratar_cliente(sock_cliente: socket.socket, endereco, registro: RegistroClie
                 sock_cliente.close()
             except OSError:
                 pass
-            print(f"Conexao encerrada: {cliente.nome} ({endereco})")
+            print(f"{_prefixo_hora()} {_c('Conexao encerrada', _Cor.VERMELHO)}: {cliente.nome} ({_formatar_endereco(endereco)})")
             _broadcast_sala(
                 registro,
                 sala_no_momento_da_saida,
@@ -457,7 +513,7 @@ def tratar_cliente(sock_cliente: socket.socket, endereco, registro: RegistroClie
                 sock_cliente.close()
             except OSError:
                 pass
-            print(f"Conexao encerrada antes do login: {endereco}")
+            print(f"{_prefixo_hora()} {_c('Conexao encerrada antes do login', _Cor.CINZA)}: {_formatar_endereco(endereco)}")
 
 
 # --------------------------------------------------------------------------
@@ -526,7 +582,7 @@ def loop_accept(socket_servidor: socket.socket, registro: RegistroClientes) -> N
         except OSError:
             return  # socket_servidor foi fechado — encerramento normal
 
-        print(f"Nova conexao de {endereco}")
+        print(f"{_prefixo_hora()} {_c('Nova conexao', _Cor.CIANO)}: {_formatar_endereco(endereco)}")
         thread = threading.Thread(
             target=tratar_cliente,
             args=(sock_cliente, endereco, registro),
@@ -554,21 +610,21 @@ def main() -> None:
         # rodando nela, ou outro processo qualquer). Sem este tratamento,
         # o usuário via um traceback cru — inconsistente com o padrão de
         # mensagens amigáveis já usado em cliente_app.py para erros
-        # equivalentes do lado do cliente.
-        print(f"[erro] não foi possível iniciar o servidor na porta {args.porta}: {erro}")
-        print(
-            "[dica] a porta provavelmente já está em uso (outro servidor.py "
-            "já rodando nela?) — tente outra porta com --porta, ou encerre "
-            "o processo que já está usando essa."
-        )
+        # equivalentes do lado do cliente. Mensagem encurtada de
+        # propósito: o texto bruto do sistema operacional (ex: "[WinError
+        # 10048] Normalmente é permitida apenas uma utilização de cada
+        # endereço de soquete...") não ajuda o usuário e só polui a tela
+        # — a dica logo abaixo já diz o que fazer.
+        print(f"{_c('[erro]', _Cor.VERMELHO)} não foi possível iniciar o servidor na porta {args.porta} — já está em uso.")
+        print(f"{_c('[dica]', _Cor.CINZA)} tente outra porta (--porta) ou encerre o processo que já está usando essa.")
         sys.exit(1)
 
-    print(f"Servidor escutando em {HOST_PADRAO}:{args.porta} (Ctrl+C para encerrar)")
+    print(f"{_prefixo_hora()} {_c('Servidor escutando em', _Cor.VERDE)} {HOST_PADRAO}:{args.porta} (Ctrl+C para encerrar)")
 
     try:
         loop_accept(socket_servidor, registro)
     except KeyboardInterrupt:
-        print("\nEncerrando servidor...")
+        print(f"\n{_c('Encerrando servidor...', _Cor.AMARELO)}")
     finally:
         socket_servidor.close()
 

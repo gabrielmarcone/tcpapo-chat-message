@@ -37,9 +37,69 @@ import os
 import socket
 import sys
 import threading
+from datetime import datetime
 from typing import Optional, Tuple
 
 import protocolo
+
+
+# --------------------------------------------------------------------------
+# Saída no terminal — só cosmético (a pedido, para deixar as mensagens mais
+# legíveis: cores por tipo + horário). NÃO afeta protocolo nem lógica de
+# rede, e não é verificado por nenhum teste (test_cliente.py testa valores
+# de retorno, não texto impresso). Cores só aparecem quando a saída é um
+# terminal de verdade (sys.stdout.isatty()) — redirecionada para arquivo
+# ou capturada por teste, sai como texto puro.
+# --------------------------------------------------------------------------
+
+class _Cor:
+    RESET = "\033[0m"
+    CINZA = "\033[90m"
+    VERDE = "\033[92m"
+    AMARELO = "\033[93m"
+    VERMELHO = "\033[91m"
+    AZUL = "\033[94m"
+    MAGENTA = "\033[95m"
+    CIANO = "\033[96m"
+    NEGRITO = "\033[1m"
+
+
+_USAR_COR = sys.stdout.isatty()
+
+if sys.platform == "win32" and _USAR_COR:
+    # Em terminais Windows mais antigos (fora do Windows Terminal), o
+    # processamento de sequências ANSI vem desligado por padrão.
+    # os.system("") é um truque conhecido e sem dependência externa que
+    # liga isso pro resto do processo — no Windows Terminal já vem
+    # ligado, então isso é só uma rede de segurança para outros terminais.
+    os.system("")
+
+
+def _c(texto: str, cor: str) -> str:
+    """Aplica `cor` a `texto` só se a saída for um terminal de verdade."""
+    if not _USAR_COR:
+        return texto
+    return f"{cor}{texto}{_Cor.RESET}"
+
+
+def _hora() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _ok(texto: str) -> None:
+    print(f"{_c('[ok]', _Cor.VERDE)} {texto}")
+
+
+def _erro(texto: str) -> None:
+    print(f"{_c('[erro]', _Cor.VERMELHO)} {texto}")
+
+
+def _aviso(texto: str) -> None:
+    print(f"{_c('[aviso]', _Cor.AMARELO)} {texto}")
+
+
+def _info(texto: str) -> None:
+    print(f"{_c('[info]', _Cor.CIANO)} {texto}")
 
 
 # --------------------------------------------------------------------------
@@ -106,32 +166,29 @@ def conectar(ip: str, porta: int) -> socket.socket:
     try:
         sock.connect((ip, porta))
     except ConnectionRefusedError:
-        print(f"[erro] conexão recusada por {ip}:{porta} "
-              f"(servidor não está escutando nesse endereço/porta?)")
+        _erro(f"conexão recusada por {ip}:{porta} (servidor não está escutando aí?)")
         sock.close()
         sys.exit(1)
     except socket.gaierror:
-        print(f"[erro] não foi possível resolver o endereço '{ip}' "
-              f"(IP ou host inválido).")
+        _erro(f"não foi possível resolver o endereço '{ip}' (IP ou host inválido).")
         sock.close()
         sys.exit(1)
     except socket.timeout:
-        print(f"[erro] tempo esgotado ({TIMEOUT_CONEXAO:.0f}s) ao tentar "
-              f"conectar a {ip}:{porta} — servidor pode estar "
-              f"indisponível ou inacessível na rede.")
+        _erro(f"tempo esgotado ({TIMEOUT_CONEXAO:.0f}s) ao conectar a {ip}:{porta} "
+              f"— servidor indisponível ou inacessível na rede.")
         sock.close()
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n[info] conexão cancelada pelo usuário.")
+        _info("conexão cancelada pelo usuário.")
         sock.close()
         sys.exit(0)
     except OSError as erro:
-        print(f"[erro] falha de rede ao conectar a {ip}:{porta}: {erro}")
+        _erro(f"falha de rede ao conectar a {ip}:{porta} ({erro}).")
         sock.close()
         sys.exit(1)
 
     sock.settimeout(None)
-    print(f"[ok] conectado a {ip}:{porta}")
+    _ok(f"conectado a {ip}:{porta}")
     return sock
 
 
@@ -171,32 +228,37 @@ class EstadoCliente:
 def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
     """Formata e imprime na tela uma mensagem já desserializada do servidor."""
     tipo = msg.get("tipo")
+    hora = _c(f"[{_hora()}]", _Cor.CINZA)
 
     if tipo == protocolo.TIPO_MENSAGEM_GERAL:
-        print(f"[{estado.sala_atual}] {msg.get('remetente', '?')}: {msg.get('texto', '')}")
+        sala = _c(f"[{estado.sala_atual}]", _Cor.AZUL)
+        remetente = _c(msg.get("remetente", "?"), _Cor.NEGRITO)
+        print(f"{hora} {sala} {remetente}: {msg.get('texto', '')}")
     elif tipo == protocolo.TIPO_MENSAGEM_PRIVADA:
-        print(f"[privado de {msg.get('remetente', '?')}] {msg.get('texto', '')}")
+        rotulo = _c("(privado)", _Cor.MAGENTA)
+        remetente = _c(msg.get("remetente", "?"), _Cor.NEGRITO)
+        print(f"{hora} {rotulo} {remetente}: {msg.get('texto', '')}")
     elif tipo == protocolo.TIPO_NOTIFICACAO:
-        print(f"* {msg.get('texto', '')}")
+        print(f"{hora} {_c('»', _Cor.AMARELO)} {_c(msg.get('texto', ''), _Cor.AMARELO)}")
     elif tipo == protocolo.TIPO_ERRO:
-        print(f"[erro do servidor] {msg.get('motivo', '')}")
+        print(f"{hora} {_c('[erro do servidor]', _Cor.VERMELHO)} {msg.get('motivo', '')}")
     elif tipo == protocolo.TIPO_LISTA_USUARIOS:
         # Adicionado na etapa 4: sem isso, a resposta de /lista caía no
         # "else" genérico abaixo e mostrava o dict cru na tela.
         usuarios = msg.get("usuarios", [])
+        print(f"{hora} {_c('[lista]', _Cor.CIANO)} usuários conectados:")
         if not usuarios:
-            print("[lista] nenhum usuário conectado.")
+            print("    nenhum usuário conectado.")
         else:
-            print("[lista] usuários conectados:")
             for usuario in usuarios:
-                nome = usuario.get("nome", "?")
+                nome = _c(usuario.get("nome", "?"), _Cor.NEGRITO)
                 sala = usuario.get("sala", "?")
-                print(f"    - {nome} (sala: {sala})")
+                print(f"    - {nome} ({sala})")
     else:
         # Tipo não tratado ainda (não deveria acontecer, dado o contrato
         # fechado de protocolo.py). Não inventamos formatação para campos
         # que não conhecemos — só exibimos bruto.
-        print(f"[{tipo}] {msg}")
+        print(f"{hora} [{tipo}] {msg}")
 
 
 # --------------------------------------------------------------------------
@@ -232,17 +294,17 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
         while True:
             nome = input("Escolha um apelido: ").strip()
             if not nome:
-                print("[aviso] o apelido não pode ser vazio.")
+                _aviso("o apelido não pode ser vazio.")
                 continue
 
             try:
                 sock.sendall(protocolo.serializar(protocolo.msg_login(nome)))
-            except (BrokenPipeError, ConnectionResetError) as erro:
-                print(f"[erro] conexão perdida ao enviar login: {erro}")
+            except (BrokenPipeError, ConnectionResetError):
+                _erro("conexão perdida ao enviar login.")
                 sock.close()
                 sys.exit(1)
             except OSError as erro:
-                print(f"[erro] falha ao enviar login: {erro}")
+                _erro(f"falha ao enviar login ({erro}).")
                 sock.close()
                 sys.exit(1)
 
@@ -250,17 +312,17 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
             while resposta is None:
                 try:
                     dados = sock.recv(4096)
-                except (BrokenPipeError, ConnectionResetError) as erro:
-                    print(f"[erro] conexão perdida durante o login: {erro}")
+                except (BrokenPipeError, ConnectionResetError):
+                    _erro("conexão perdida durante o login.")
                     sock.close()
                     sys.exit(1)
-                except OSError as erro:
-                    print(f"[erro] conexão perdida durante o login: {erro}")
+                except OSError:
+                    _erro("conexão perdida durante o login.")
                     sock.close()
                     sys.exit(1)
 
                 if not dados:
-                    print("[erro] servidor fechou a conexão durante o login.")
+                    _erro("servidor fechou a conexão durante o login.")
                     sock.close()
                     sys.exit(1)
 
@@ -268,7 +330,7 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
                 try:
                     mensagens, buffer = protocolo.extrair_mensagens(buffer)
                 except protocolo.ErroProtocolo as erro:
-                    print(f"[erro de protocolo] {erro}")
+                    _erro(f"erro de protocolo: {erro}")
                     continue
 
                 for msg in mensagens:
@@ -284,13 +346,13 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
                     imprimir_mensagem(msg, EstadoCliente())
 
             if resposta["tipo"] == protocolo.TIPO_LOGIN_OK:
-                print(f"[ok] login bem-sucedido como '{resposta['nome']}'.")
+                _ok(f"login bem-sucedido como '{resposta['nome']}'.")
                 return resposta["nome"], buffer
 
-            print(f"[login recusado] {resposta['motivo']}")
+            _aviso(f"login recusado: {resposta['motivo']}")
             # volta ao topo do laço externo para pedir outro apelido
     except KeyboardInterrupt:
-        print("\n[info] login cancelado pelo usuário.")
+        _info("login cancelado pelo usuário.")
         try:
             sock.close()
         except OSError:
@@ -320,7 +382,7 @@ def _encerrar_conexao_forcado(sock: socket.socket, mensagem: str) -> None:
     sys.exit() apenas levanta SystemExit, que uma thread secundária não
     consegue propagar para a thread principal bloqueada em input().
     """
-    print(f"\n{mensagem}")
+    print(f"\n{_c(mensagem, _Cor.VERMELHO)}")
     try:
         sock.close()
     except OSError:
@@ -360,12 +422,10 @@ def thread_recepcao(
     while not evento_encerrando.is_set():
         try:
             dados = sock.recv(4096)
-        except (ConnectionResetError, BrokenPipeError) as erro:
+        except (ConnectionResetError, BrokenPipeError):
             if evento_encerrando.is_set():
                 break
-            _encerrar_conexao_forcado(
-                sock, f"[erro] conexão perdida com o servidor: {erro}"
-            )
+            _encerrar_conexao_forcado(sock, "[erro] conexão perdida com o servidor.")
         except OSError:
             # Caso mais comum aqui: socket fechado localmente por
             # encerrar() (thread principal) — desligamento esperado.
@@ -374,15 +434,13 @@ def thread_recepcao(
         if not dados:
             if evento_encerrando.is_set():
                 break
-            _encerrar_conexao_forcado(
-                sock, "[servidor] a conexão foi encerrada pelo servidor."
-            )
+            _encerrar_conexao_forcado(sock, "[servidor] conexão encerrada pelo servidor.")
 
         buffer += dados
         try:
             mensagens, buffer = protocolo.extrair_mensagens(buffer)
         except protocolo.ErroProtocolo as erro:
-            print(f"\n[erro de protocolo] {erro}")
+            _erro(f"erro de protocolo: {erro}")
             continue
 
         for msg in mensagens:
@@ -415,13 +473,13 @@ def enviar(sock: socket.socket, mensagem: dict) -> bool:
     except protocolo.ErroProtocolo as erro:
         # Só ocorreria por engano de programação local (dict fora do
         # formato) — nunca por causa do que o usuário digitou.
-        print(f"[erro interno] mensagem malformada não enviada: {erro}")
+        _erro(f"mensagem malformada não enviada ({erro}).")
         return False
-    except (BrokenPipeError, ConnectionResetError) as erro:
-        print(f"[erro] conexão perdida ao enviar mensagem: {erro}")
+    except (BrokenPipeError, ConnectionResetError):
+        _erro("conexão perdida ao enviar mensagem.")
         return False
     except OSError as erro:
-        print(f"[erro] falha ao enviar mensagem: {erro}")
+        _erro(f"falha ao enviar mensagem ({erro}).")
         return False
 
 
@@ -443,13 +501,12 @@ COMANDO_SAIR_SALA = "/sair_sala"
 COMANDO_SAIR = "/sair"
 
 TEXTO_AJUDA_COMANDOS = (
-    "Comandos disponíveis:\n"
-    f"  {COMANDO_PRIV} <usuario> <mensagem>  - envia mensagem privada\n"
-    f"  {COMANDO_LISTA}                      - lista usuários conectados\n"
-    f"  {COMANDO_ENTRAR} <sala>              - entra em uma sala\n"
-    f"  {COMANDO_SAIR_SALA}                  - volta para a sala geral\n"
-    f"  {COMANDO_SAIR}                       - encerra a conexão\n"
-    "Qualquer outro texto (que não comece com '/') é enviado como mensagem geral."
+    f"  {COMANDO_PRIV} <usuario> <mensagem>   envia mensagem privada\n"
+    f"  {COMANDO_LISTA}                       lista usuários conectados\n"
+    f"  {COMANDO_ENTRAR} <sala>               entra em uma sala\n"
+    f"  {COMANDO_SAIR_SALA}                   volta para a sala geral\n"
+    f"  {COMANDO_SAIR}                        encerra a conexão\n"
+    "  <texto livre>                  mensagem para o chat geral"
 )
 
 
@@ -457,8 +514,7 @@ def _comando_invalido(uso: str) -> Tuple[str, None]:
     """Imprime a mensagem de ajuda para um comando malformado e devolve o
     par (ACAO_INVALIDO, None) que parse_comando() deve retornar. Nenhuma
     mensagem é enviada ao servidor nesse caso."""
-    print(f"[uso] {uso}")
-    print(TEXTO_AJUDA_COMANDOS)
+    print(f"{_c('[uso]', _Cor.AMARELO)} {uso}")
     return ACAO_INVALIDO, None
 
 
@@ -554,7 +610,7 @@ def encerrar(sock: socket.socket, evento_encerrando: threading.Event) -> None:
     except OSError:
         pass  # já pode estar fechado do outro lado; não é um erro real aqui
     sock.close()
-    print("[ok] conexão encerrada.")
+    _ok("conexão encerrada.")
 
 
 # --------------------------------------------------------------------------
@@ -577,7 +633,7 @@ def main() -> None:
 
     ip = args.ip.strip()
     if not ip:
-        print("[erro] --ip não pode ser vazio.")
+        _erro("--ip não pode ser vazio.")
         sys.exit(1)
 
     # sock e thread começam como None: em caso de erro/Ctrl+C bem no
@@ -601,10 +657,16 @@ def main() -> None:
         )
         thread.start()
 
-        print(f"Bem-vindo(a), {nome}. Digite uma mensagem e pressione Enter "
-              f"para enviar ao chat geral, ou {COMANDO_SAIR} para encerrar. "
-              f"Ctrl+C também encerra.")
+        largura = 60
+        linha = _c("─" * largura, _Cor.CINZA)
+        print(linha)
+        print(f" {_c('Bem-vindo(a), ' + nome + '!', _Cor.VERDE + _Cor.NEGRITO)}")
+        print(f" Digite uma mensagem e Enter para enviar ao chat geral.")
+        print(f" {_c(COMANDO_SAIR, _Cor.NEGRITO)} ou Ctrl+C encerra a qualquer momento.")
+        print(linha)
+        print(_c(" Comandos:", _Cor.CINZA))
         print(TEXTO_AJUDA_COMANDOS)
+        print(linha)
 
         while not evento_encerrando.is_set():
             try:
@@ -623,7 +685,7 @@ def main() -> None:
                 continue
 
             if acao == ACAO_SAIR:
-                print(f"[info] encerrando ({COMANDO_SAIR})...")
+                _info(f"encerrando ({COMANDO_SAIR})...")
                 break
 
             # acao == ACAO_ENVIAR
@@ -632,7 +694,7 @@ def main() -> None:
                 # o loop continuava tentando digitar/enviar normalmente,
                 # mesmo com a conexão já morta. Agora encerramos a sessão
                 # de forma limpa assim que um envio falha de verdade.
-                print("[info] encerrando devido a falha no envio.")
+                _info("encerrando devido a falha no envio.")
                 break
 
             # Atualização otimista da sala local (ver EstadoCliente) —
@@ -643,7 +705,7 @@ def main() -> None:
             elif mensagem["tipo"] == protocolo.TIPO_SAIR_SALA:
                 estado.sala_atual = "geral"
     except KeyboardInterrupt:
-        print("\n[info] encerrando (Ctrl+C)...")
+        _info("encerrando (Ctrl+C)...")
     finally:
         if sock is not None and thread is not None and evento_encerrando is not None:
             # Sessão completa: login concluído, thread de recepção rodando.

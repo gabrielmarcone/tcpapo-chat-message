@@ -29,6 +29,7 @@ import protocolo
 import servidor
 from modelos import Cliente, RegistroClientes
 from persistencia import Historico
+from usuarios import Usuarios
 
 
 # --------------------------------------------------------------------------
@@ -50,12 +51,13 @@ def servidor_rodando():
     """
     registro = RegistroClientes()
     historico = Historico(":memory:")
+    usuarios = Usuarios(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
 
     thread_accept = threading.Thread(
         target=servidor.loop_accept,
-        args=(sock_servidor, registro, historico),
+        args=(sock_servidor, registro, historico, usuarios),
         daemon=True,
     )
     thread_accept.start()
@@ -64,6 +66,7 @@ def servidor_rodando():
 
     sock_servidor.close()
     historico.fechar()
+    usuarios.fechar()
 
 
 class ClienteDeTeste:
@@ -106,6 +109,16 @@ class ClienteDeTeste:
             pass
 
 
+def _login(cliente_teste: ClienteDeTeste, nome: str, senha: str = "senha123") -> None:
+    """
+    Helper para reduzir a repetição de protocolo.msg_login(nome, senha)
+    — usado só nos testes novos de autenticação abaixo (os testes já
+    existentes já tinham a senha embutida inline antes deste helper
+    existir, e não foram reescritos para usá-lo sem necessidade).
+    """
+    cliente_teste.enviar(protocolo.msg_login(nome, senha))
+
+
 # --------------------------------------------------------------------------
 # Login
 # --------------------------------------------------------------------------
@@ -114,7 +127,7 @@ def test_login_com_sucesso(servidor_rodando):
     porta, _registro = servidor_rodando
     c = ClienteDeTeste(porta)
 
-    c.enviar(protocolo.msg_login("alice"))
+    c.enviar(protocolo.msg_login("alice", "senha123"))
     assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
 
     c.fechar()
@@ -123,16 +136,16 @@ def test_login_com_sucesso(servidor_rodando):
 def test_login_nome_duplicado_permite_nova_tentativa(servidor_rodando):
     porta, _registro = servidor_rodando
     c1 = ClienteDeTeste(porta)
-    c1.enviar(protocolo.msg_login("alice"))
+    c1.enviar(protocolo.msg_login("alice", "senha123"))
     assert c1.receber()["tipo"] == "login_ok"
 
     c2 = ClienteDeTeste(porta)
-    c2.enviar(protocolo.msg_login("alice"))
+    c2.enviar(protocolo.msg_login("alice", "senha123"))
     assert c2.receber()["tipo"] == "login_erro"
 
     # decisão da Especificação (seção 5): a conexão continua aberta,
     # permitindo nova tentativa com outro nome, sem reconectar
-    c2.enviar(protocolo.msg_login("alice2"))
+    c2.enviar(protocolo.msg_login("alice2", "senha123"))
     assert c2.receber() == {"tipo": "login_ok", "nome": "alice2"}
 
     c1.fechar()
@@ -147,7 +160,7 @@ def test_primeira_mensagem_deve_ser_login(servidor_rodando):
     assert c.receber()["tipo"] == "erro"
 
     # conexão continua viva — pode logar em seguida
-    c.enviar(protocolo.msg_login("alice"))
+    c.enviar(protocolo.msg_login("alice", "senha123"))
     assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
 
     c.fechar()
@@ -160,7 +173,7 @@ def test_login_com_nome_vazio_e_rejeitado(servidor_rodando):
     c.enviar({"tipo": "login", "nome": "   "})
     assert c.receber()["tipo"] == "login_erro"
 
-    c.enviar(protocolo.msg_login("alice"))
+    c.enviar(protocolo.msg_login("alice", "senha123"))
     assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
 
     c.fechar()
@@ -181,14 +194,14 @@ def test_login_com_nome_contendo_espaco_e_rejeitado(servidor_rodando):
     porta, registro = servidor_rodando
     c = ClienteDeTeste(porta)
 
-    c.enviar(protocolo.msg_login("Joao Pedro"))
+    c.enviar(protocolo.msg_login("Joao Pedro", "senha123"))
     resposta = c.receber()
     assert resposta["tipo"] == "login_erro"
     assert "espaco" in resposta["motivo"]
     assert registro.buscar("Joao Pedro") is None
 
     # conexão continua viva — pode tentar de novo com um nome válido
-    c.enviar(protocolo.msg_login("joao_pedro"))
+    c.enviar(protocolo.msg_login("joao_pedro", "senha123"))
     assert c.receber() == {"tipo": "login_ok", "nome": "joao_pedro"}
 
     c.fechar()
@@ -203,7 +216,7 @@ def test_login_com_nome_contendo_tab_ou_quebra_de_linha_e_rejeitado(servidor_rod
     porta, _registro = servidor_rodando
     c = ClienteDeTeste(porta)
 
-    c.enviar(protocolo.msg_login("joao\tpedro"))
+    c.enviar(protocolo.msg_login("joao\tpedro", "senha123"))
     assert c.receber()["tipo"] == "login_erro"
 
     c.fechar()
@@ -214,13 +227,13 @@ def test_login_com_nome_muito_longo_e_rejeitado(servidor_rodando):
     c = ClienteDeTeste(porta)
 
     nome_longo = "x" * 150
-    c.enviar(protocolo.msg_login(nome_longo))
+    c.enviar(protocolo.msg_login(nome_longo, "senha123"))
     resposta = c.receber()
     assert resposta["tipo"] == "login_erro"
     assert "longo" in resposta["motivo"]
     assert registro.buscar(nome_longo) is None
 
-    c.enviar(protocolo.msg_login("alice"))
+    c.enviar(protocolo.msg_login("alice", "senha123"))
     assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
 
     c.fechar()
@@ -235,15 +248,15 @@ def test_login_duplicado_sem_distincao_de_maiusculas_minusculas(servidor_rodando
     """
     porta, _registro = servidor_rodando
     c1 = ClienteDeTeste(porta)
-    c1.enviar(protocolo.msg_login("Alice"))
+    c1.enviar(protocolo.msg_login("Alice", "senha123"))
     assert c1.receber()["tipo"] == "login_ok"
 
     c2 = ClienteDeTeste(porta)
-    c2.enviar(protocolo.msg_login("alice"))  # mesmo nome, case diferente
+    c2.enviar(protocolo.msg_login("alice", "senha123"))  # mesmo nome, case diferente
     resposta = c2.receber()
     assert resposta["tipo"] == "login_erro"
 
-    c2.enviar(protocolo.msg_login("alice2"))
+    c2.enviar(protocolo.msg_login("alice2", "senha123"))
     assert c2.receber()["tipo"] == "login_ok"
 
     c1.fechar()
@@ -257,11 +270,11 @@ def test_login_duplicado_sem_distincao_de_maiusculas_minusculas(servidor_rodando
 def test_broadcast_chega_aos_outros_da_sala(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
 
     # alice recebe a notificação de entrada do bob (ela já estava na sala)
@@ -283,7 +296,7 @@ def test_remetente_nao_recebe_a_propria_mensagem_geral(servidor_rodando):
     """
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_mensagem_geral_enviar("oi"))
@@ -305,18 +318,21 @@ def test_broadcast_nao_vaza_para_fora_da_sala_do_remetente():
     """
     registro = RegistroClientes()
     historico = Historico(":memory:")
+    usuarios = Usuarios(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
-    thread_accept = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro, historico), daemon=True)
+    thread_accept = threading.Thread(
+        target=servidor.loop_accept, args=(sock_servidor, registro, historico, usuarios), daemon=True
+    )
     thread_accept.start()
 
     try:
         alice = ClienteDeTeste(porta)
-        alice.enviar(protocolo.msg_login("alice"))
+        alice.enviar(protocolo.msg_login("alice", "senha123"))
         assert alice.receber()["tipo"] == "login_ok"
 
         bob = ClienteDeTeste(porta)
-        bob.enviar(protocolo.msg_login("bob"))
+        bob.enviar(protocolo.msg_login("bob", "senha123"))
         assert bob.receber()["tipo"] == "login_ok"
         assert alice.receber()["tipo"] == "notificacao"  # bob entrou
 
@@ -335,6 +351,7 @@ def test_broadcast_nao_vaza_para_fora_da_sala_do_remetente():
     finally:
         sock_servidor.close()
         historico.fechar()
+        usuarios.fechar()
 
 
 # --------------------------------------------------------------------------
@@ -344,7 +361,7 @@ def test_broadcast_nao_vaza_para_fora_da_sala_do_remetente():
 def test_comando_sair_encerra_conexao_de_forma_limpa(servidor_rodando):
     porta, registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_sair())
@@ -362,11 +379,11 @@ def test_comando_sair_encerra_conexao_de_forma_limpa(servidor_rodando):
 def test_desconexao_abrupta_remove_do_registro_e_notifica(servidor_rodando):
     porta, registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber() == {"tipo": "notificacao", "texto": "bob entrou no chat"}
 
@@ -386,7 +403,7 @@ def test_desconexao_e_registrada_no_console_do_servidor(servidor_rodando, capsys
     """
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.fechar()
@@ -407,7 +424,7 @@ def test_desconexao_e_registrada_no_console_do_servidor(servidor_rodando, capsys
 def test_mensagem_malformada_recebe_erro_mas_conexao_continua(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar_bruto(b'{"sem_tipo_valido": true}\n')
@@ -433,11 +450,11 @@ def test_mensagem_malformada_recebe_erro_mas_conexao_continua(servidor_rodando):
 def test_mensagem_privada_chega_ao_destinatario_correto(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"  # bob entrou
 
@@ -452,16 +469,16 @@ def test_mensagem_privada_chega_ao_destinatario_correto(servidor_rodando):
 def test_mensagem_privada_nao_vaza_para_terceiros(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"
 
     carol = ClienteDeTeste(porta)
-    carol.enviar(protocolo.msg_login("carol"))
+    carol.enviar(protocolo.msg_login("carol", "senha123"))
     assert carol.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"  # carol entrou
     assert bob.receber()["tipo"] == "notificacao"
@@ -482,11 +499,11 @@ def test_mensagem_privada_nao_vaza_para_terceiros(servidor_rodando):
 def test_mensagem_privada_independe_de_sala(servidor_rodando):
     porta, registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"
 
@@ -505,7 +522,7 @@ def test_mensagem_privada_independe_de_sala(servidor_rodando):
 def test_mensagem_privada_destinatario_inexistente_recebe_erro(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_mensagem_privada_enviar("fantasma", "oi"))
@@ -519,7 +536,7 @@ def test_mensagem_privada_destinatario_inexistente_recebe_erro(servidor_rodando)
 def test_mensagem_privada_campo_destinatario_invalido(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar({"tipo": "mensagem_privada", "destinatario": "", "texto": "oi"})
@@ -565,11 +582,11 @@ def test_mensagem_privada_com_destinatario_quebrado_nao_propaga_erro():
 def test_entrar_sala_move_o_cliente_e_notifica_as_duas_salas(servidor_rodando):
     porta, registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"  # bob entrou no chat (sala geral)
 
@@ -597,20 +614,23 @@ def test_entrar_sala_notifica_quem_ja_estava_na_sala_nova_mas_nao_o_proprio():
     """
     registro = RegistroClientes()
     historico = Historico(":memory:")
+    usuarios = Usuarios(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
-    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro, historico), daemon=True)
+    thread = threading.Thread(
+        target=servidor.loop_accept, args=(sock_servidor, registro, historico, usuarios), daemon=True
+    )
     thread.start()
 
     try:
         carol = ClienteDeTeste(porta)
-        carol.enviar(protocolo.msg_login("carol"))
+        carol.enviar(protocolo.msg_login("carol", "senha123"))
         assert carol.receber()["tipo"] == "login_ok"
         carol.enviar(protocolo.msg_entrar_sala("jogos"))
         assert carol.receber()["tipo"] == "notificacao"  # confirmação própria
 
         bob = ClienteDeTeste(porta)
-        bob.enviar(protocolo.msg_login("bob"))
+        bob.enviar(protocolo.msg_login("bob", "senha123"))
         assert bob.receber()["tipo"] == "login_ok"
 
         bob.enviar(protocolo.msg_entrar_sala("jogos"))
@@ -629,12 +649,13 @@ def test_entrar_sala_notifica_quem_ja_estava_na_sala_nova_mas_nao_o_proprio():
     finally:
         sock_servidor.close()
         historico.fechar()
+        usuarios.fechar()
 
 
 def test_sair_sala_volta_para_geral_reaproveitando_o_mesmo_mecanismo(servidor_rodando):
     porta, registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_entrar_sala("jogos"))
@@ -652,14 +673,17 @@ def test_sair_sala_volta_para_geral_reaproveitando_o_mesmo_mecanismo(servidor_ro
 def test_entrar_na_mesma_sala_que_ja_esta_e_no_op_com_aviso():
     registro = RegistroClientes()
     historico = Historico(":memory:")
+    usuarios = Usuarios(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
-    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro, historico), daemon=True)
+    thread = threading.Thread(
+        target=servidor.loop_accept, args=(sock_servidor, registro, historico, usuarios), daemon=True
+    )
     thread.start()
 
     try:
         alice = ClienteDeTeste(porta)
-        alice.enviar(protocolo.msg_login("alice"))
+        alice.enviar(protocolo.msg_login("alice", "senha123"))
         assert alice.receber()["tipo"] == "login_ok"
 
         # alice ja esta em "geral" por padrao
@@ -677,6 +701,7 @@ def test_entrar_na_mesma_sala_que_ja_esta_e_no_op_com_aviso():
     finally:
         sock_servidor.close()
         historico.fechar()
+        usuarios.fechar()
 
 
 def test_entrar_sala_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
@@ -689,14 +714,14 @@ def test_entrar_sala_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
     """
     porta, registro = servidor_rodando
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
 
     bob.enviar(protocolo.msg_entrar_sala("Jogos"))  # com maiuscula
     bob.receber()  # confirmação
 
     carol = ClienteDeTeste(porta)
-    carol.enviar(protocolo.msg_login("carol"))
+    carol.enviar(protocolo.msg_login("carol", "senha123"))
     assert carol.receber()["tipo"] == "login_ok"
 
     carol.enviar(protocolo.msg_entrar_sala("jogos"))  # minusculo -- mesma sala?
@@ -719,7 +744,7 @@ def test_entrar_sala_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
 def test_entrar_sala_muito_longa_e_rejeitada(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_entrar_sala("x" * 100))
@@ -733,7 +758,7 @@ def test_entrar_sala_muito_longa_e_rejeitada(servidor_rodando):
 def test_entrar_sala_campo_invalido(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar({"tipo": "entrar_sala", "sala": ""})
@@ -747,11 +772,11 @@ def test_entrar_sala_campo_invalido(servidor_rodando):
 def test_mensagem_geral_apos_trocar_de_sala_vai_para_a_sala_nova(servidor_rodando):
     porta, registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"
 
@@ -777,11 +802,11 @@ def test_mensagem_geral_apos_trocar_de_sala_vai_para_a_sala_nova(servidor_rodand
 def test_listar_usuarios_mostra_todos_com_sala_correta(servidor_rodando):
     porta, registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"
 
@@ -809,14 +834,14 @@ def test_listar_usuarios_funciona_de_qualquer_sala(servidor_rodando):
     """
     porta, registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_entrar_sala("jogos"))
     alice.receber()  # confirmação
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
 
     # alice (em "jogos") pede a lista -- deve incluir bob (em "geral") também
@@ -836,7 +861,7 @@ def test_listar_usuarios_funciona_de_qualquer_sala(servidor_rodando):
 def test_historico_de_sala_vazia_retorna_lista_vazia(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_historico())
@@ -850,11 +875,11 @@ def test_historico_de_sala_vazia_retorna_lista_vazia(servidor_rodando):
 def test_historico_traz_mensagens_gerais_ja_enviadas(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"  # bob entrou
 
@@ -882,11 +907,11 @@ def test_historico_nao_inclui_mensagem_privada(servidor_rodando):
     """Decisão de design: só mensagem geral é persistida, nunca privada."""
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     bob = ClienteDeTeste(porta)
-    bob.enviar(protocolo.msg_login("bob"))
+    bob.enviar(protocolo.msg_login("bob", "senha123"))
     assert bob.receber()["tipo"] == "login_ok"
     assert alice.receber()["tipo"] == "notificacao"
 
@@ -905,7 +930,7 @@ def test_historico_nao_inclui_mensagem_privada(servidor_rodando):
 def test_historico_e_isolado_por_sala(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_mensagem_geral_enviar("mensagem na geral"))
@@ -928,7 +953,7 @@ def test_historico_e_isolado_por_sala(servidor_rodando):
 def test_historico_respeita_limite_pedido(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     for i in range(5):
@@ -946,7 +971,7 @@ def test_historico_respeita_limite_pedido(servidor_rodando):
 def test_historico_com_limite_invalido_nao_quebra(servidor_rodando):
     porta, _registro = servidor_rodando
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
 
     alice.enviar(protocolo.msg_mensagem_geral_enviar("oi"))
@@ -979,20 +1004,21 @@ class _HistoricoFalsoQueQuebra:
 def test_falha_ao_persistir_historico_nao_impede_entrega_da_mensagem_geral():
     registro = RegistroClientes()
     historico_falso = _HistoricoFalsoQueQuebra()
+    usuarios = Usuarios(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     porta = sock_servidor.getsockname()[1]
     thread = threading.Thread(
-        target=servidor.loop_accept, args=(sock_servidor, registro, historico_falso), daemon=True
+        target=servidor.loop_accept, args=(sock_servidor, registro, historico_falso, usuarios), daemon=True
     )
     thread.start()
 
     try:
         alice = ClienteDeTeste(porta)
-        alice.enviar(protocolo.msg_login("alice"))
+        alice.enviar(protocolo.msg_login("alice", "senha123"))
         assert alice.receber()["tipo"] == "login_ok"
 
         bob = ClienteDeTeste(porta)
-        bob.enviar(protocolo.msg_login("bob"))
+        bob.enviar(protocolo.msg_login("bob", "senha123"))
         assert bob.receber()["tipo"] == "login_ok"
         assert alice.receber()["tipo"] == "notificacao"
 
@@ -1008,6 +1034,7 @@ def test_falha_ao_persistir_historico_nao_impede_entrega_da_mensagem_geral():
         bob.fechar()
     finally:
         sock_servidor.close()
+        usuarios.fechar()
 
 
 def test_mensagem_malformada_durante_a_fase_de_login(servidor_rodando):
@@ -1021,7 +1048,7 @@ def test_mensagem_malformada_durante_a_fase_de_login(servidor_rodando):
     # a linha malformada precisa ser CONSUMIDA do buffer — se não for
     # (bug corrigido em protocolo.ErroProtocolo), o login abaixo receberia
     # o mesmo erro de framing de novo, em vez de login_ok
-    c.enviar(protocolo.msg_login("alice"))
+    c.enviar(protocolo.msg_login("alice", "senha123"))
     assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
 
     c.fechar()
@@ -1030,7 +1057,7 @@ def test_mensagem_malformada_durante_a_fase_de_login(servidor_rodando):
 def test_tipo_de_mensagem_totalmente_desconhecido_recebe_erro(servidor_rodando):
     porta, _registro = servidor_rodando
     c = ClienteDeTeste(porta)
-    c.enviar(protocolo.msg_login("alice"))
+    c.enviar(protocolo.msg_login("alice", "senha123"))
     assert c.receber()["tipo"] == "login_ok"
 
     c.enviar({"tipo": "tipo_que_nao_existe_no_protocolo"})
@@ -1049,7 +1076,7 @@ def test_desconexao_antes_de_completar_login_nao_derruba_o_servidor(servidor_rod
     # o servidor não deve quebrar — um cliente novo consegue logar em seguida
     time.sleep(0.1)
     c = ClienteDeTeste(porta)
-    c.enviar(protocolo.msg_login("alice"))
+    c.enviar(protocolo.msg_login("alice", "senha123"))
     assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
     assert registro.buscar("alice") is not None
 
@@ -1133,23 +1160,27 @@ class _SocketFalsoQueBraNoClose:
 def test_tratar_cliente_nao_propaga_erro_se_close_falhar_apos_login():
     registro = RegistroClientes()
     historico = Historico(":memory:")
-    login_bytes = protocolo.serializar(protocolo.msg_login("alice"))
+    usuarios = Usuarios(":memory:")
+    login_bytes = protocolo.serializar(protocolo.msg_login("alice", "senha123"))
     sair_bytes = protocolo.serializar(protocolo.msg_sair())
     sock_falso = _SocketFalsoQueBraNoClose([login_bytes, sair_bytes])
 
-    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico)  # não deve propagar
+    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico, usuarios)  # não deve propagar
 
     assert registro.buscar("alice") is None
     historico.fechar()
+    usuarios.fechar()
 
 
 def test_tratar_cliente_nao_propaga_erro_se_close_falhar_antes_do_login():
     registro = RegistroClientes()
     historico = Historico(":memory:")
+    usuarios = Usuarios(":memory:")
     sock_falso = _SocketFalsoQueBraNoClose([])  # recv já retorna vazio: cliente nunca loga
 
-    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico)  # não deve propagar
+    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico, usuarios)  # não deve propagar
     historico.fechar()
+    usuarios.fechar()
 
 
 class _SocketFalsoQueQuebraNoRecv:
@@ -1180,16 +1211,18 @@ class _SocketFalsoQueQuebraNoRecv:
 def test_tratar_cliente_trata_oserror_abrupto_durante_roteamento_sem_propagar():
     registro = RegistroClientes()
     historico = Historico(":memory:")
-    login_bytes = protocolo.serializar(protocolo.msg_login("alice"))
+    usuarios = Usuarios(":memory:")
+    login_bytes = protocolo.serializar(protocolo.msg_login("alice", "senha123"))
     sock_falso = _SocketFalsoQueQuebraNoRecv([login_bytes])
 
     # apos o login, o proximo recv() levanta OSError (simulando reset) em
     # vez de retornar b"" -- deve ser tratado pelo except OSError externo,
     # sem propagar, e o cliente deve ser removido do registro do mesmo jeito
-    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico)
+    servidor.tratar_cliente(sock_falso, ("127.0.0.1", 0), registro, historico, usuarios)
 
     assert registro.buscar("alice") is None
     historico.fechar()
+    usuarios.fechar()
 
 
 # --------------------------------------------------------------------------
@@ -1204,11 +1237,13 @@ def test_loop_accept_retorna_se_socket_ja_estiver_fechado():
     """
     registro = RegistroClientes()
     historico = Historico(":memory:")
+    usuarios = Usuarios(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
     sock_servidor.close()
 
-    servidor.loop_accept(sock_servidor, registro, historico)  # não deve lançar, nem travar
+    servidor.loop_accept(sock_servidor, registro, historico, usuarios)  # não deve lançar, nem travar
     historico.fechar()
+    usuarios.fechar()
 
 
 def test_loop_accept_encerra_rapido_mesmo_sem_conexoes_pendentes():
@@ -1223,9 +1258,12 @@ def test_loop_accept_encerra_rapido_mesmo_sem_conexoes_pendentes():
     """
     registro = RegistroClientes()
     historico = Historico(":memory:")
+    usuarios = Usuarios(":memory:")
     sock_servidor = servidor.criar_socket_servidor("127.0.0.1", 0)
 
-    thread = threading.Thread(target=servidor.loop_accept, args=(sock_servidor, registro, historico), daemon=True)
+    thread = threading.Thread(
+        target=servidor.loop_accept, args=(sock_servidor, registro, historico, usuarios), daemon=True
+    )
     thread.start()
     time.sleep(0.05)  # garante que a thread já entrou no loop de accept()
 
@@ -1234,6 +1272,7 @@ def test_loop_accept_encerra_rapido_mesmo_sem_conexoes_pendentes():
 
     assert not thread.is_alive()
     historico.fechar()
+    usuarios.fechar()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="comportamento de SO_REUSEADDR e diferente no Windows")
@@ -1283,11 +1322,14 @@ def test_main_le_porta_via_argumento_e_nao_bloqueia(monkeypatch, capsys):
     """
     recebido = {}
 
-    def loop_accept_fake(sock_servidor, _registro, _historico):
+    def loop_accept_fake(sock_servidor, _registro, _historico, _usuarios):
         recebido["porta"] = sock_servidor.getsockname()[1]
 
     monkeypatch.setattr(servidor, "loop_accept", loop_accept_fake)
-    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "0", "--banco", ":memory:"])
+    monkeypatch.setattr(
+        "sys.argv",
+        ["servidor.py", "--porta", "0", "--banco", ":memory:", "--banco-usuarios", ":memory:"],
+    )
 
     servidor.main()
 

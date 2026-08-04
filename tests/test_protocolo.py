@@ -27,7 +27,7 @@ from protocolo import ErroProtocolo
 # --------------------------------------------------------------------------
 
 def test_serializar_mensagem_simples():
-    mensagem = protocolo.msg_login("alice")
+    mensagem = protocolo.msg_login("alice", "senha123")
     bruto = protocolo.serializar(mensagem)
 
     assert isinstance(bruto, bytes)
@@ -35,7 +35,7 @@ def test_serializar_mensagem_simples():
     assert bruto.count(b"\n") == 1  # exatamente um delimitador de framing
 
     texto = bruto.decode("utf-8").rstrip("\n")
-    assert json.loads(texto) == {"tipo": "login", "nome": "alice"}
+    assert json.loads(texto) == {"tipo": "login", "nome": "alice", "senha": "senha123"}
 
 
 def test_serializar_exige_campo_tipo():
@@ -247,7 +247,7 @@ def test_erro_protocolo_levantado_por_serializar_tem_valores_padrao():
 @pytest.mark.parametrize(
     "construtor,args,esperado",
     [
-        (protocolo.msg_login, ("alice",), {"tipo": "login", "nome": "alice"}),
+        (protocolo.msg_login, ("alice", "senha123"), {"tipo": "login", "nome": "alice", "senha": "senha123"}),
         (protocolo.msg_mensagem_geral_enviar, ("oi",), {"tipo": "mensagem_geral", "texto": "oi"}),
         (
             protocolo.msg_mensagem_privada_enviar,
@@ -332,7 +332,7 @@ def test_todas_as_mensagens_construidas_sao_serializaveis():
     esquecer o campo 'tipo' ou produzir um tipo vazio).
     """
     construidas = [
-        protocolo.msg_login("alice"),
+        protocolo.msg_login("alice", "senha123"),
         protocolo.msg_mensagem_geral_enviar("oi"),
         protocolo.msg_mensagem_privada_enviar("bob", "oi"),
         protocolo.msg_listar_usuarios(),

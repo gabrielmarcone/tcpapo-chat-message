@@ -19,36 +19,40 @@ Uso:
 Estado desta implementação (etapas do plano de divisão de trabalho):
 --------------------------------------------------------------------------
 
-IMPLEMENTADO:
-    1-2. Leitura de porta via argparse + loop de accept em 0.0.0.0.
-    3.   Loop de leitura por cliente (buffer + protocolo.extrair_mensagens).
+IMPLEMENTADO (todas as etapas 1-11 do plano):
+    1-2. Leitura de porta via argparse + loop de accept em 0.0.0.0, com
+         timeout curto no accept() para Ctrl+C responder rápido (não
+         confiável em todas as plataformas sem isso, sobretudo Windows).
+    3.   Loop de leitura por cliente (buffer + protocolo.extrair_mensagens,
+         tolerante a linha malformada isolada — ver _extrair_mensagens_
+         tolerante).
     4.   Login (nome único, login_ok/login_erro, conexão permanece aberta
-         em caso de erro).
+         em caso de erro, permitindo nova tentativa).
     5.   Mensagem geral / broadcast restrito à sala do remetente.
-    9-11 (adiantadas): a estrutura try/finally do loop de leitura já
-         garante remoção única do cliente (seção 9) tanto na saída limpa
-         (comando 'sair') quanto na desconexão abrupta (recv retorna
-         vazio, ou qualquer OSError) — não fazia sentido escrever um loop
-         de leitura "incompleto" que ignorasse esses casos, então eles
-         saíram prontos junto com o loop desde o início, em vez de
-         ficarem para depois. O broadcast (_broadcast_sala) já isola
-         falha de envio por destinatário (etapa 11/12).
+    6.   Mensagem privada (destinatário inexistente -> erro; falha de
+         entrega isolada, não afeta o remetente).
+    7.   Salas: entrar_sala e sair_sala compartilhando o MESMO mecanismo
+         (_mudar_sala_do_cliente) — sair_sala é só entrar_sala("geral").
+    8.   Listagem de usuários (todos os conectados, com a sala de cada um
+         — não só os da sala de quem perguntou).
+    9-11. Remoção única do cliente (saída limpa ou abrupta) via
+         try/finally, robustez de broadcast (falha isolada por
+         destinatário), e — acrescentado depois de um teste de estresse
+         real que encontrou corrupção de framing — lock de envio por
+         cliente (Cliente.lock_envio, em modelos.py), necessário porque
+         mensagem privada faz threads DIFERENTES escreverem no socket de
+         OUTRO cliente, e socket.sendall() não é atômico entre chamadas
+         concorrentes de threads distintas para o mesmo socket.
 
-    >>> CHECKPOINT DE INTEGRAÇÃO ANTECIPADO <<<
-    Login + mensagem_geral estão prontos. A partir daqui, rodar
-    cliente_app.py real (Dev B, etapa 3) contra este servidor, antes de
-    prosseguir para as etapas abaixo.
-
-AINDA NÃO IMPLEMENTADO (respondem com tipo 'erro', "ainda não
-implementado nesta etapa" — placeholder explícito, não falha silenciosa):
-    6. Mensagem privada.
-    7. Salas (entrar_sala / sair_sala).
-    8. Listagem de usuários (listar_usuarios).
-
-Decisão de design tomada aqui (vale registrar no relatório): o remetente
-de uma mensagem_geral NÃO recebe de volta a própria mensagem no
-broadcast — ele já vê o que digitou no próprio terminal (input()), então
-ecoar de volta seria duplicado. Só os DEMAIS membros da sala recebem.
+Decisões de design tomadas aqui (vale registrar no relatório):
+    - O remetente de uma mensagem_geral NÃO recebe de volta a própria
+      mensagem no broadcast — ele já vê o que digitou no próprio
+      terminal (input()), então ecoar de volta seria duplicado. Só os
+      DEMAIS membros da sala recebem.
+    - Em _mudar_sala_do_cliente, a mutação de sala_atual acontece ANTES
+      dos broadcasts — isso faz o cliente se excluir naturalmente do
+      broadcast da sala antiga (já não está mais listado nela), sem
+      precisar de parâmetro extra para isso.
 """
 
 import argparse
@@ -75,20 +79,52 @@ TAMANHO_BUFFER_RECV = 4096
 # nova chegava e liberava o accept().
 TIMEOUT_ACCEPT_SEGUNDOS = 0.5
 
-# Tipos de mensagem cujo roteamento ainda não foi implementado nesta etapa
-# (etapas 6-8 do plano) — respondem com erro explícito em vez de serem
-# ignorados silenciosamente ou derrubarem a conexão.
-_TIPOS_AINDA_NAO_IMPLEMENTADOS = frozenset({
-    protocolo.TIPO_MENSAGEM_PRIVADA,
-    protocolo.TIPO_ENTRAR_SALA,
-    protocolo.TIPO_SAIR_SALA,
-    protocolo.TIPO_LISTAR_USUARIOS,
-})
+# Lock que serializa a sequência "mudar estado visível a outros clientes
+# (registrar login, ou trocar de sala) + anunciar via broadcast" em
+# relação a OUTRAS sequências do mesmo tipo rodando em paralelo.
+#
+# Necessário para que a ORDEM dos avisos que um cliente recebe corresponda
+# à ordem real dos eventos — bug real encontrado via teste de estresse
+# (600 logins em sequência rápida): socket.sendall() libera o GIL durante
+# a chamada de rede, então era possível um cliente que logou DEPOIS
+# terminar seu próprio ciclo de login+anúncio ANTES de um cliente que
+# logou ANTES dele terminar o dele, fazendo o primeiro receber um aviso
+# de entrada de alguém que, do ponto de vista dele, já devia estar lá.
+#
+# Cobre só login e troca de sala — não mensagem_geral/privada, que não
+# têm essa exigência de ordem entre remetentes diferentes (mensagens de
+# chat naturalmente intercalam por ordem de chegada, isso é esperado).
+#
+# Importante: cobre só a "janela de commit" (registrar + enviar +
+# anunciar, tudo rápido), nunca a espera por input do usuário durante o
+# login (que pode demorar indefinidamente) — travar nisso prenderia todo
+# mundo atrás de quem está mais lento para digitar o nome.
+_lock_anuncio = threading.Lock()
 
 
 # --------------------------------------------------------------------------
 # Envio
 # --------------------------------------------------------------------------
+# Duas famílias de função aqui, de propósito:
+#
+#   _enviar / _enviar_erro_seguro (recebem socket.socket cru): usadas
+#   SÓ durante a fase de login (_processar_login), antes de o cliente
+#   existir no RegistroClientes. Nesse momento, nenhuma outra thread tem
+#   referência a esse socket ainda — só a própria thread desta conexão —
+#   então não há risco de escrita concorrente, e não precisa de lock.
+#
+#   _enviar_para_cliente / _enviar_seguro_para_cliente /
+#   _enviar_erro_seguro_para_cliente (recebem um Cliente): usadas para
+#   QUALQUER envio depois que o cliente está registrado — respostas
+#   diretas (lista de usuários, confirmação de sala, erros) E broadcasts/
+#   mensagens privadas vindas de outras threads. A partir desse ponto,
+#   múltiplas threads podem ter referência ao mesmo socket ao mesmo
+#   tempo, e socket.sendall() NÃO é atômico entre chamadas concorrentes
+#   de threads diferentes para o MESMO socket — confirmado por teste de
+#   estresse (mensagens grandes o suficiente para exigir mais de um
+#   send() interno tinham bytes de threads diferentes intercalados,
+#   corrompendo o framing). Por isso essas funções sempre passam pelo
+#   cliente.lock_envio antes de escrever.
 
 def _enviar(sock: socket.socket, mensagem: dict) -> None:
     sock.sendall(protocolo.serializar(mensagem))
@@ -100,6 +136,9 @@ def _enviar_erro_seguro(sock: socket.socket, motivo: str) -> None:
     falhar, o socket provavelmente já está quebrado por outro motivo, e
     quem chama vai descobrir isso do jeito normal (recv retornando vazio
     ou lançando OSError) no próximo ciclo do loop.
+
+    Usar SÓ durante a fase de login (ver nota da seção acima) — depois
+    que o cliente está registrado, usar a variante _..._para_cliente.
     """
     try:
         _enviar(sock, protocolo.msg_erro(motivo))
@@ -107,7 +146,35 @@ def _enviar_erro_seguro(sock: socket.socket, motivo: str) -> None:
         pass
 
 
-def _extrair_mensagens_tolerante(buffer: bytes, sock_cliente: socket.socket) -> tuple:
+def _enviar_para_cliente(cliente: Cliente, mensagem: dict) -> None:
+    """Envia `mensagem` para `cliente`, sob o lock de envio dele (ver nota da seção acima)."""
+    _enviar_bytes_para_cliente(cliente, protocolo.serializar(mensagem))
+
+
+def _enviar_bytes_para_cliente(cliente: Cliente, linha: bytes) -> None:
+    """
+    Variante de baixo nível de _enviar_para_cliente, recebendo bytes já
+    serializados em vez de um dict — usada por _broadcast_sala para
+    serializar a mensagem UMA VEZ e reenviar os mesmos bytes a vários
+    destinatários, em vez de serializar de novo a cada um.
+    """
+    with cliente.lock_envio:
+        cliente.socket.sendall(linha)
+
+
+def _enviar_seguro_para_cliente(cliente: Cliente, mensagem: dict) -> None:
+    """Como _enviar_para_cliente, mas não propaga OSError (mesma lógica de _enviar_erro_seguro)."""
+    try:
+        _enviar_para_cliente(cliente, mensagem)
+    except OSError:
+        pass
+
+
+def _enviar_erro_seguro_para_cliente(cliente: Cliente, motivo: str) -> None:
+    _enviar_seguro_para_cliente(cliente, protocolo.msg_erro(motivo))
+
+
+def _extrair_mensagens_tolerante(buffer: bytes, enviar_erro) -> tuple:
     """
     Chama protocolo.extrair_mensagens em loop, recuperando as mensagens
     válidas mesmo quando uma linha no meio do lote é malformada.
@@ -118,6 +185,10 @@ def _extrair_mensagens_tolerante(buffer: bytes, sock_cliente: socket.socket) -> 
     integração (ver ErroProtocolo em protocolo.py). Cada linha malformada
     gera um aviso 'erro' ao cliente; as mensagens válidas antes e depois
     dela no mesmo lote são preservadas e processadas normalmente.
+
+    `enviar_erro` é uma função (motivo: str) -> None, para que quem chama
+    escolha o mecanismo de envio certo: socket cru durante o login, ou
+    _enviar_erro_seguro_para_cliente depois que o cliente já existe.
     """
     todas_mensagens = []
     resto = buffer
@@ -129,7 +200,7 @@ def _extrair_mensagens_tolerante(buffer: bytes, sock_cliente: socket.socket) -> 
         except protocolo.ErroProtocolo as erro:
             todas_mensagens.extend(erro.mensagens_processadas)
             resto = erro.buffer_restante
-            _enviar_erro_seguro(sock_cliente, str(erro))
+            enviar_erro(str(erro))
 
 
 def _broadcast_sala(
@@ -157,7 +228,7 @@ def _broadcast_sala(
         if excluir_nome is not None and cliente.nome == excluir_nome:
             continue
         try:
-            cliente.socket.sendall(linha)
+            _enviar_bytes_para_cliente(cliente, linha)
         except OSError:
             continue  # falha isolada — ver docstring acima
 
@@ -181,6 +252,11 @@ def _processar_login(
     Qualquer outro tipo de mensagem recebido antes do login é rejeitado
     com erro, mas não derruba a conexão — o cliente pode tentar de novo.
 
+    O registro (RegistroClientes.adicionar), o envio de login_ok, e o
+    broadcast de "entrou no chat" acontecem juntos, sob _lock_anuncio —
+    ver o comentário da constante para o porquê (bug de ordem de eventos
+    encontrado via teste de estresse).
+
     Retorna (cliente, buffer_restante). `cliente` é None se a conexão foi
     encerrada (recv vazio) antes de um login bem-sucedido.
     """
@@ -190,7 +266,9 @@ def _processar_login(
             return None, buffer  # desconectou antes de logar
 
         buffer += dados
-        mensagens, buffer = _extrair_mensagens_tolerante(buffer, sock_cliente)
+        mensagens, buffer = _extrair_mensagens_tolerante(
+            buffer, lambda motivo: _enviar_erro_seguro(sock_cliente, motivo)
+        )
 
         for msg in mensagens:
             if msg["tipo"] != protocolo.TIPO_LOGIN:
@@ -203,17 +281,60 @@ def _processar_login(
                 continue
 
             cliente = Cliente(nome=nome, sock=sock_cliente, endereco=endereco)
-            if registro.adicionar(cliente):
-                _enviar(sock_cliente, protocolo.msg_login_ok(nome))
-                return cliente, buffer
 
-            _enviar(sock_cliente, protocolo.msg_login_erro("nome ja em uso"))
-            # conexão continua aberta — cliente pode tentar outro nome
+            with _lock_anuncio:
+                if not registro.adicionar(cliente):
+                    _enviar(sock_cliente, protocolo.msg_login_erro("nome ja em uso"))
+                    continue  # conexão continua aberta — cliente pode tentar outro nome
+
+                _enviar(sock_cliente, protocolo.msg_login_ok(nome))
+                _broadcast_sala(
+                    registro,
+                    cliente.sala_atual,
+                    protocolo.msg_notificacao(f"{nome} entrou no chat"),
+                    excluir_nome=nome,
+                )
+
+            return cliente, buffer
 
 
 # --------------------------------------------------------------------------
 # Roteamento de mensagens já autenticadas
 # --------------------------------------------------------------------------
+
+def _mudar_sala_do_cliente(registro: RegistroClientes, cliente: Cliente, nova_sala: str) -> None:
+    """
+    Implementa entrar_sala E sair_sala com o MESMO mecanismo (sair_sala é
+    só uma chamada com nova_sala="geral") — seção 7 da Especificação:
+    nenhum caminho de código separado para as duas operações.
+
+    Ordem de operações importante: a mutação de sala_atual (via
+    RegistroClientes.mudar_sala, sob lock) acontece ANTES dos
+    broadcasts. Isso faz o cliente se excluir naturalmente do broadcast
+    da sala antiga (listar_por_sala já não o encontra mais lá — não
+    precisa de excluir_nome ali). Já no broadcast da sala nova, ele
+    PRECISA de excluir_nome, porque a essa altura o cliente já aparece
+    listado nela e receberia a própria notificação de volta.
+
+    Tudo isso acontece sob _lock_anuncio — mesma razão do login: sem
+    isso, duas trocas de sala concorrentes poderiam anunciar seus
+    eventos fora de ordem (ver comentário da constante).
+    """
+    sala_antiga = cliente.sala_atual
+    if nova_sala == sala_antiga:
+        _enviar_para_cliente(cliente, protocolo.msg_notificacao(f"voce ja esta na sala '{nova_sala}'"))
+        return
+
+    with _lock_anuncio:
+        registro.mudar_sala(cliente.nome, nova_sala)
+        _broadcast_sala(registro, sala_antiga, protocolo.msg_notificacao(f"{cliente.nome} saiu da sala"))
+        _broadcast_sala(
+            registro, nova_sala,
+            protocolo.msg_notificacao(f"{cliente.nome} entrou na sala"),
+            excluir_nome=cliente.nome,
+        )
+        _enviar_para_cliente(cliente, protocolo.msg_notificacao(f"voce entrou na sala '{nova_sala}'"))
+
 
 def _rotear_mensagem(registro: RegistroClientes, cliente: Cliente, msg: dict) -> bool:
     """
@@ -232,14 +353,41 @@ def _rotear_mensagem(registro: RegistroClientes, cliente: Cliente, msg: dict) ->
         _broadcast_sala(registro, cliente.sala_atual, mensagem_repasse, excluir_nome=cliente.nome)
         return True
 
-    if tipo in _TIPOS_AINDA_NAO_IMPLEMENTADOS:
-        _enviar_erro_seguro(
-            cliente.socket,
-            f"recurso '{tipo}' ainda nao implementado nesta etapa do desenvolvimento",
-        )
+    if tipo == protocolo.TIPO_MENSAGEM_PRIVADA:
+        destinatario_nome = msg.get("destinatario")
+        texto = msg.get("texto", "")
+        if not isinstance(destinatario_nome, str) or not destinatario_nome.strip():
+            _enviar_erro_seguro_para_cliente(cliente, "campo 'destinatario' invalido ou ausente")
+            return True
+        destinatario = registro.buscar(destinatario_nome)
+        if destinatario is None:
+            _enviar_erro_seguro_para_cliente(cliente, f"destinatario '{destinatario_nome}' nao encontrado")
+            return True
+        mensagem_repasse = protocolo.msg_mensagem_privada_repassar(cliente.nome, texto)
+        # falha isolada: se o destinatário desconectou bem nesse instante,
+        # a remoção dele é feita pela própria thread dele (seção 9) — não
+        # é responsabilidade de quem está mandando a mensagem privada.
+        _enviar_seguro_para_cliente(destinatario, mensagem_repasse)
         return True
 
-    _enviar_erro_seguro(cliente.socket, f"tipo de mensagem desconhecido: {tipo!r}")
+    if tipo == protocolo.TIPO_ENTRAR_SALA:
+        sala_pedida = msg.get("sala")
+        if not isinstance(sala_pedida, str) or not sala_pedida.strip():
+            _enviar_erro_seguro_para_cliente(cliente, "campo 'sala' invalido ou ausente")
+            return True
+        _mudar_sala_do_cliente(registro, cliente, sala_pedida.strip())
+        return True
+
+    if tipo == protocolo.TIPO_SAIR_SALA:
+        _mudar_sala_do_cliente(registro, cliente, "geral")
+        return True
+
+    if tipo == protocolo.TIPO_LISTAR_USUARIOS:
+        usuarios = registro.listar_todos()
+        _enviar_seguro_para_cliente(cliente, protocolo.msg_lista_usuarios(usuarios))
+        return True
+
+    _enviar_erro_seguro_para_cliente(cliente, f"tipo de mensagem desconhecido: {tipo!r}")
     return True
 
 
@@ -265,12 +413,9 @@ def tratar_cliente(sock_cliente: socket.socket, endereco, registro: RegistroClie
         if cliente is None:
             return  # desconectou antes de completar o login
 
-        _broadcast_sala(
-            registro,
-            cliente.sala_atual,
-            protocolo.msg_notificacao(f"{cliente.nome} entrou no chat"),
-            excluir_nome=cliente.nome,
-        )
+        # O broadcast de "entrou no chat" já acontece dentro de
+        # _processar_login (sob _lock_anuncio, junto com o registro e o
+        # login_ok) — ver docstring lá para o porquê.
 
         while True:
             dados = sock_cliente.recv(TAMANHO_BUFFER_RECV)
@@ -278,7 +423,9 @@ def tratar_cliente(sock_cliente: socket.socket, endereco, registro: RegistroClie
                 break  # desconexão abrupta
 
             buffer += dados
-            mensagens, buffer = _extrair_mensagens_tolerante(buffer, sock_cliente)
+            mensagens, buffer = _extrair_mensagens_tolerante(
+                buffer, lambda motivo: _enviar_erro_seguro_para_cliente(cliente, motivo)
+            )
 
             continuar = True
             for msg in mensagens:

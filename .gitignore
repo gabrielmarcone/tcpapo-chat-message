@@ -18,3 +18,9 @@ Thumbs.db
 
 # Logs eventuais de execução manual durante testes
 *.log
+
+# Bancos SQLite gerados em tempo de execução (histórico de mensagens) —
+# nunca devem ser versionados: são dados de sessão, não código-fonte, e
+# agora que o nome é isolado por porta (chat_historico_<porta>.db), cada
+# execução local pode gerar vários arquivos diferentes.
+*.db

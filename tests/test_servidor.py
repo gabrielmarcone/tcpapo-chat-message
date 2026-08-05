@@ -1,14 +1,12 @@
 """
 tests/test_servidor.py — Testes de integração do servidor (servidor.py)
 
-Dono: DEV A.
-
 Diferente de tests/test_modelos.py (que testa RegistroClientes chamando os
 métodos diretamente), estes testes sobem um servidor de verdade num socket
 TCP real (porta 0 = o SO escolhe uma porta livre) e conectam clientes de
 teste reais nele — exercitando o loop de accept, o loop de leitura, o
-framing via protocolo.py, e o roteamento, exatamente como vai acontecer na
-demonstração ao vivo com cliente_app.py real.
+framing via protocolo.py, e o roteamento, exatamente como acontece numa
+sessão real com cliente_app.py.
 
 O teste de concorrência de login duplicado (duas threads tentando registrar
 o mesmo nome ao mesmo tempo) já está coberto rigorosamente em
@@ -181,15 +179,13 @@ def test_login_com_nome_vazio_e_rejeitado(servidor_rodando):
 
 def test_login_com_nome_contendo_espaco_e_rejeitado(servidor_rodando):
     """
-    Bug real encontrado em teste manual: um apelido com espaço (ex:
-    "Joao Pedro") é aceito no login, mas quebra /priv — que espera
+    Um apelido com espaço (ex: "Joao Pedro") quebraria /priv, que espera
     exatamente dois argumentos separados por espaço (destinatário e
-    texto), então só "Joao" (a primeira palavra) era usado como
-    destinatário, e a mensagem privada sempre falhava com "destinatario
-    'Joao' nao encontrado". Em vez de complicar o parsing do cliente com
-    aspas/escape, a correção é simples e direta: apelido não pode conter
-    espaço, com erro claro na hora do login (não só descoberto depois,
-    ao tentar usar /priv).
+    texto) — só "Joao" (a primeira palavra) seria usado como
+    destinatário, e a mensagem privada sempre falharia com
+    "destinatario 'Joao' nao encontrado". Em vez de complicar o parsing
+    do cliente com aspas/escape, a regra é simples e direta: apelido não
+    pode conter espaço, com erro claro já na hora do login.
     """
     porta, registro = servidor_rodando
     c = ClienteDeTeste(porta)
@@ -241,9 +237,9 @@ def test_login_com_nome_muito_longo_e_rejeitado(servidor_rodando):
 
 def test_login_duplicado_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
     """
-    Bug real encontrado: 'Alice' e 'alice' conseguiam logar ao mesmo
-    tempo como usuários diferentes — e /priv alice só encontrava o que
-    tivesse EXATAMENTE esse case. Complementa o teste equivalente em
+    'Alice' e 'alice' não podem logar ao mesmo tempo como usuários
+    diferentes — e /priv alice precisa encontrar a conta independente do
+    case usado. Complementa o teste equivalente em
     tests/test_modelos.py, mas aqui de ponta a ponta com sockets reais.
     """
     porta, _registro = servidor_rodando
@@ -495,11 +491,10 @@ def test_remetente_nao_recebe_a_propria_mensagem_geral(servidor_rodando):
 
 def test_broadcast_nao_vaza_para_fora_da_sala_do_remetente():
     """
-    Ainda que salas (entrar_sala) não estejam implementadas nesta etapa,
-    o filtro por sala em _broadcast_sala já está ativo e é testável
-    manipulando sala_atual diretamente via RegistroClientes.mudar_sala —
-    útil como teste de regressão para quando a etapa de salas for
-    implementada de verdade.
+    Testa o filtro por sala em _broadcast_sala manipulando sala_atual
+    diretamente via RegistroClientes.mudar_sala, em vez de passar pelo
+    comando entrar_sala — isola o teste desse mecanismo específico do
+    resto do fluxo de troca de sala.
     """
     registro = RegistroClientes()
     historico = Historico(":memory:")
@@ -521,8 +516,8 @@ def test_broadcast_nao_vaza_para_fora_da_sala_do_remetente():
         assert bob.receber()["tipo"] == "login_ok"
         assert alice.receber()["tipo"] == "notificacao"  # bob entrou
 
-        # move bob para outra sala diretamente no registro (sem depender
-        # do comando entrar_sala, que ainda não existe nesta etapa)
+        # move bob para outra sala diretamente no registro, sem passar
+        # pelo comando entrar_sala
         assert registro.mudar_sala("bob", "jogos") is True
 
         alice.enviar(protocolo.msg_mensagem_geral_enviar("oi"))
@@ -629,7 +624,7 @@ def test_mensagem_malformada_recebe_erro_mas_conexao_continua(servidor_rodando):
 
 
 # --------------------------------------------------------------------------
-# Mensagem privada (etapa 6)
+# Mensagem privada
 # --------------------------------------------------------------------------
 
 def test_mensagem_privada_chega_ao_destinatario_correto(servidor_rodando):
@@ -761,7 +756,7 @@ def test_mensagem_privada_com_destinatario_quebrado_nao_propaga_erro():
 
 
 # --------------------------------------------------------------------------
-# Salas (etapa 7)
+# Salas
 # --------------------------------------------------------------------------
 
 def test_entrar_sala_move_o_cliente_e_notifica_as_duas_salas(servidor_rodando):
@@ -891,11 +886,10 @@ def test_entrar_na_mesma_sala_que_ja_esta_e_no_op_com_aviso():
 
 def test_entrar_sala_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
     """
-    Bug real encontrado (parecido com o do nome de usuário): 'Jogos' e
-    'jogos' eram tratadas como salas DIFERENTES — dois clientes que
-    combinam de se encontrar na "mesma" sala, mas digitam o nome com
-    capitalização diferente, ficavam cada um sozinho, sem ver o outro,
-    sem nenhum erro ou aviso.
+    'Jogos' e 'jogos' precisam ser tratadas como a mesma sala — sem
+    isso, dois clientes que combinam de se encontrar na "mesma" sala,
+    mas digitam o nome com capitalização diferente, ficariam cada um
+    sozinho, sem ver o outro, sem nenhum erro ou aviso.
     """
     porta, registro = servidor_rodando
     bob = ClienteDeTeste(porta)
@@ -981,7 +975,7 @@ def test_mensagem_geral_apos_trocar_de_sala_vai_para_a_sala_nova(servidor_rodand
 
 
 # --------------------------------------------------------------------------
-# Listagem de usuários (etapa 8)
+# Listagem de usuários
 # --------------------------------------------------------------------------
 
 def test_listar_usuarios_mostra_todos_com_sala_correta(servidor_rodando):
@@ -1281,8 +1275,7 @@ def test_enviar_erro_seguro_nao_propaga_excecao_com_socket_fechado():
 def test_broadcast_sala_isola_falha_de_destinatario_sem_interromper_os_demais():
     """
     Um destinatário com socket já quebrado não deve impedir que os demais
-    destinatários da mesma sala recebam a mensagem (etapa 11/12 da
-    Especificação, seção 9 — robustez do broadcast).
+    destinatários da mesma sala recebam a mensagem.
     """
     registro = RegistroClientes()
 
@@ -1480,9 +1473,8 @@ def test_criar_socket_servidor_impede_dois_binds_na_mesma_porta_linux_mac():
 @pytest.mark.skipif(sys.platform != "win32", reason="SO_EXCLUSIVEADDRUSE so existe no Windows")
 def test_criar_socket_servidor_impede_dois_binds_na_mesma_porta_windows():
     """
-    Regressão do bug real encontrado em teste manual no Windows: com
-    SO_REUSEADDR puro, o Windows permitia dois processos escutando a
-    MESMA porta ao mesmo tempo, silenciosamente (sem erro nenhum) — bem
+    No Windows, SO_REUSEADDR puro permitiria dois processos escutando a
+    mesma porta ao mesmo tempo, silenciosamente (sem erro nenhum) — bem
     diferente do Linux/Mac. SO_EXCLUSIVEADDRUSE corrige isso: o segundo
     bind deve falhar, exatamente como no Linux/Mac.
 
@@ -1524,8 +1516,8 @@ def test_main_le_porta_via_argumento_e_nao_bloqueia(monkeypatch, capsys):
 
 
 # --------------------------------------------------------------------------
-# Isolamento do histórico por porta (bug real: duas instâncias em portas
-# diferentes, sem --banco, liam/escreviam no mesmo arquivo padrão fixo)
+# Isolamento do histórico por porta: duas instâncias em portas diferentes,
+# sem --banco, não devem ler/escrever no mesmo arquivo.
 # --------------------------------------------------------------------------
 
 def test_resolver_caminho_banco_sem_banco_explicito_isola_por_porta():

@@ -1,23 +1,17 @@
 """
-dev_tools/cliente_stub.py — Cliente simulado, para o Dev A testar o
-servidor.py manualmente no terminal, sem depender do cliente_app.py real.
+dev_tools/cliente_stub.py — Cliente simulado para testar servidor.py
+manualmente no terminal, sem depender do cliente_app.py real.
 
-Dono: DEV A.
-
-Faz parte do repositório (não é descartável) — é evidência, para o
-relatório, de que o servidor foi testado de ponta a ponta antes da
-integração real com o cliente do Dev B. Usa protocolo.py de verdade para
-montar e interpretar mensagens — nunca constrói ou lê JSON manualmente.
+Usa protocolo.py de verdade para montar e interpretar mensagens — nunca
+constrói ou lê JSON manualmente.
 
 Uso:
     python dev_tools/cliente_stub.py --ip 127.0.0.1 --porta 5000 --nome alice
 
-Roda uma sequência fixa de ações (login, mensagem geral, tentativa de
-recurso ainda não implementado, sair), imprimindo cada resposta recebida
-do servidor — útil para uma checagem rápida e manual antes de rodar a
-suíte de testes automatizada, ou para observar o comportamento em tempo
-real durante o desenvolvimento das próximas etapas (privada, salas,
-listagem).
+Roda uma sequência fixa de ações (login, mensagem geral, listagem de
+usuários, sair), imprimindo cada resposta recebida do servidor — útil
+para uma checagem rápida e manual, sem precisar rodar a suíte de testes
+completa nem um cliente_app.py interativo.
 """
 
 import argparse
@@ -75,7 +69,7 @@ def main() -> None:
     enviar(protocolo.msg_mensagem_geral_enviar("mensagem de teste do cliente-stub"))
 
     enviar(protocolo.msg_listar_usuarios())
-    receber_uma()  # hoje ainda responde 'erro' (nao implementado nesta etapa)
+    receber_uma()
 
     enviar(protocolo.msg_sair())
 

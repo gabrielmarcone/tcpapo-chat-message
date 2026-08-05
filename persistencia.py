@@ -6,8 +6,8 @@ Responsabilidade:
     mensagem geral roteada pelo servidor, e devolver as mais recentes de
     uma sala quando um cliente pede via o comando /historico.
 
-Decisões de design (registrar no relatório):
-    - Só mensagem GERAL é persistida, nunca privada. Logar conversa
+Decisões de design:
+    - Só mensagem geral é persistida, nunca privada. Logar conversa
       privada em disco é uma escolha de privacidade que não deveria ser
       tomada silenciosamente — fica de fora por padrão.
     - Sob demanda (comando /historico), não despejado automaticamente ao
@@ -16,12 +16,11 @@ Decisões de design (registrar no relatório):
       mensagens desta sala" com uma query simples (ORDER BY + LIMIT), em
       vez de reler e filtrar um arquivo inteiro toda vez.
     - Uma única conexão SQLite compartilhada entre todas as threads,
-      protegida por um Lock — mesmo padrão já usado em
-      RegistroClientes (modelos.py). sqlite3 não permite usar a mesma
-      conexão de threads diferentes sem cuidado extra
-      (check_same_thread=False resolve o lado do driver; o Lock resolve
-      o lado da lógica, evitando que dois INSERTs concorrentes
-      atrapalhem um ao outro).
+      protegida por um Lock — mesmo padrão usado em RegistroClientes
+      (modelos.py). sqlite3 não permite usar a mesma conexão de threads
+      diferentes sem cuidado extra (check_same_thread=False resolve o
+      lado do driver; o Lock resolve o lado da lógica, evitando que
+      dois INSERTs concorrentes atrapalhem um ao outro).
 """
 
 import sqlite3

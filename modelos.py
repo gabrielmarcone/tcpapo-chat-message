@@ -1,8 +1,6 @@
 """
 modelos.py — Estruturas de dados do servidor (tcpapo-chat-message)
 
-Dono: DEV A. Não editado por outra pessoa.
-
 Responsabilidade:
     - Classe Cliente: representa uma conexão ativa (nome, socket, endereco,
       sala_atual — valor padrão "geral").
@@ -10,25 +8,22 @@ Responsabilidade:
       por um único Lock global compartilhado entre todas as threads do
       servidor (uma thread por cliente conectado).
 
-Referência: seções 3 e 4 da Especificação de Arquitetura.
-
-Regra crítica de concorrência (seção 3):
+Regra crítica de concorrência:
     Operações de envio de rede (socket.send) para MÚLTIPLOS destinatários
     (broadcast) NÃO devem ocorrer enquanto o lock está retido. Por isso
     listar_por_sala() e listar_todos() sempre devolvem uma CÓPIA (uma nova
     lista), tirada e devolvida com o lock já liberado — quem chama nunca
     precisa (nem deve) segurar o lock deste objeto durante o envio de rede.
 
-Nota de concorrência adicional (não estava no TODO original, mas é
-necessária): buscar() devolve a referência viva ao objeto Cliente, porque
-servidor.py precisa alterar sala_atual dele ao processar entrar_sala/
-sair_sala. Se essa mutação fosse feita diretamente por quem chama
-(cliente.sala_atual = nova_sala, fora do lock), ela poderia correr em
-paralelo com uma leitura concorrente em listar_por_sala()/listar_todos()
-feita por outra thread no meio de um broadcast. Por isso existe o método
-mudar_sala(nome, nova_sala), que faz a mutação sob o lock — servidor.py
-deve sempre usar esse método para trocar a sala de um cliente, nunca
-atribuir sala_atual diretamente depois de um buscar().
+    buscar() devolve a referência viva ao objeto Cliente, porque
+    servidor.py precisa alterar sala_atual dele ao processar entrar_sala/
+    sair_sala. Se essa mutação fosse feita diretamente por quem chama
+    (cliente.sala_atual = nova_sala, fora do lock), ela poderia correr em
+    paralelo com uma leitura concorrente em listar_por_sala()/listar_todos()
+    feita por outra thread no meio de um broadcast. Por isso existe o
+    método mudar_sala(nome, nova_sala), que faz a mutação sob o lock —
+    é ele que deve ser usado para trocar a sala de um cliente, nunca
+    atribuição direta de sala_atual depois de um buscar().
 """
 
 import threading
@@ -62,13 +57,12 @@ class Cliente:
         # MÚLTIPLAS threads podem escrever no mesmo socket ao mesmo tempo:
         # a própria thread dele (respostas diretas) e qualquer outra
         # thread (broadcast, notificação de sala, mensagem privada de
-        # outro cliente). socket.sendall() NÃO é atômico entre chamadas
-        # concorrentes de threads diferentes para o MESMO socket —
-        # confirmado por teste de estresse: sem este lock, mensagens
-        # grandes o suficiente para exigir mais de um send() interno
-        # podem ter seus bytes intercalados entre duas threads
-        # diferentes, corrompendo o framing do protocolo. Quem for
-        # escrever no socket de um Cliente (servidor.py) deve sempre
+        # outro cliente). socket.sendall() não é atômico entre chamadas
+        # concorrentes de threads diferentes para o mesmo socket — sem
+        # este lock, mensagens grandes o suficiente para exigir mais de
+        # um send() interno podem ter seus bytes intercalados entre duas
+        # threads diferentes, corrompendo o framing do protocolo. Quem
+        # for escrever no socket de um Cliente (servidor.py) deve sempre
         # segurar este lock antes.
         self.lock_envio = threading.Lock()
 
@@ -85,15 +79,12 @@ class RegistroClientes:
     protegido por um único Lock global compartilhado entre todas as
     threads do servidor.
 
-    A CHAVE interna do dicionário é o nome normalizado por
-    `str.casefold()` (não o nome literal) — necessário para que "Alice"
-    e "alice" sejam tratados como o MESMO usuário para fins de unicidade
-    e busca (bug real observado: os dois conseguiam se conectar ao mesmo
-    tempo como pessoas "diferentes", e `/priv alice` não encontrava
-    "Alice" se a busca fosse por igualdade exata de string). O atributo
-    `Cliente.nome` continua guardando o nome com a capitalização
-    ORIGINAL escolhida no login — a normalização é só para comparação
-    interna, nunca para exibição.
+    A chave interna do dicionário é o nome normalizado por
+    `str.casefold()`, não o nome literal — assim "Alice" e "alice" são
+    tratados como o mesmo usuário para fins de unicidade e busca. O
+    atributo `Cliente.nome` continua guardando o nome com a
+    capitalização original escolhida no login; a normalização é só para
+    comparação interna, nunca para exibição.
 
     casefold() (não lower()) de propósito: é a forma recomendada pelo
     Python para comparação sem distinção de maiúsculas/minúsculas
@@ -163,9 +154,9 @@ class RegistroClientes:
 
     def listar_todos(self) -> list[tuple[str, str]]:
         """
-        Retorna uma lista de pares (nome, sala_atual) de TODOS os
-        clientes conectados — não só os da sala de quem pergunta, que é
-        o requisito da seção 7 da Especificação para o comando /lista.
+        Retorna uma lista de pares (nome, sala_atual) de todos os
+        clientes conectados, não só os da sala de quem pergunta — é o
+        comportamento esperado pelo comando /lista.
         """
         with self._lock:
             return [(cliente.nome, cliente.sala_atual) for cliente in self._clientes.values()]
@@ -182,7 +173,6 @@ class RegistroClientes:
             return [cliente for cliente in self._clientes.values() if cliente.sala_atual == sala]
 
     def quantidade(self) -> int:
-        """Número de clientes conectados agora. Útil para testes e para
-        decisões operacionais simples (ex: log de status do servidor)."""
+        """Número de clientes conectados agora."""
         with self._lock:
             return len(self._clientes)

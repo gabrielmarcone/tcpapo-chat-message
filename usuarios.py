@@ -5,32 +5,30 @@ Responsabilidade:
     - Persistir em SQLite o cadastro de usuários (nome + salt + hash da
       senha), usado para autenticação no login.
     - Autenticar um par (nome, senha): se o nome ainda não existe no
-      banco, CRIA o cadastro nesse primeiro uso (decisão de design: não
-      há etapa separada de "criar conta" — ver relatório); se já existe,
-      confere a senha contra o hash salvo.
+      banco, cria o cadastro nesse primeiro uso — não há etapa separada
+      de "criar conta"; se já existe, confere a senha contra o hash
+      salvo.
 
-Decisões de design (registrar no relatório):
-    - A senha NUNCA é gravada em texto puro. Guardamos
+Decisões de design:
+    - A senha nunca é gravada em texto puro. Guardamos
       sha256(salt + senha), com um salt aleatório de 16 bytes por
       usuário (secrets.token_hex), gerado uma vez no cadastro e
       reaproveitado em toda verificação seguinte. Um salt por usuário
       impede que dois usuários com a mesma senha tenham o mesmo hash no
       banco, e invalida ataques de tabela pré-computada (rainbow table)
       genérica.
-    - hashlib.sha256 é da stdlib (sem dependência externa) e mais que
-      suficiente pra um trabalho acadêmico, mas é uma função de hash
-      RÁPIDA — isso a torna fraca contra força bruta/dicionário offline
-      caso o banco vaze (hardware comum testa bilhões de tentativas por
-      segundo). bcrypt/scrypt/argon2 existem justamente para serem
-      LENTOS de propósito, o que é a escolha correta em produção. Aqui
-      ficamos com sha256+salt por simplicidade — evita o erro mais grave
-      (senha em texto puro) — mas essa limitação deve constar
-      explicitamente no relatório como ressalva consciente, não omissão.
+    - hashlib.sha256 é da biblioteca padrão e suficiente para o escopo
+      do projeto, mas é uma função de hash rápida — isso a torna fraca
+      contra força bruta/dicionário offline caso o banco vaze (hardware
+      comum testa bilhões de tentativas por segundo). bcrypt/scrypt/
+      argon2 existem justamente para serem lentos de propósito, o que é
+      a escolha correta em produção; aqui ficamos com sha256+salt por
+      simplicidade, evitando o erro mais grave (senha em texto puro),
+      mas essa é uma limitação consciente, não uma omissão.
     - Comparação do hash feita com hmac.compare_digest (tempo constante)
-      em vez de "==", para não abrir margem a timing attack — custa uma
-      linha e mostra atenção ao detalhe.
+      em vez de "==", para não abrir margem a timing attack.
     - Nome usado como chave é casefold() — mesma convenção de
-      RegistroClientes em modelos.py, "Alice" e "alice" são a mesma
+      RegistroClientes em modelos.py: "Alice" e "alice" são a mesma
       conta.
     - Mesmo padrão de concorrência de persistencia.py: uma única conexão
       SQLite compartilhada entre threads, protegida por um Lock.
@@ -92,10 +90,9 @@ class Usuarios:
         Retorna (False, motivo) se a senha não confere com a conta
         existente; `motivo` já vem pronto para protocolo.msg_login_erro.
 
-        NÃO faz a checagem de "nome já está online agora" — isso
-        continua responsabilidade de RegistroClientes, chamada ANTES
-        desta função em servidor.py:_processar_login (ver seção 3 do
-        passo a passo).
+        Não faz a checagem de "nome já está online agora" — isso
+        continua responsabilidade de RegistroClientes, chamada antes
+        desta função em servidor.py.
         """
         chave = self._chave(nome)
         with self._lock:
@@ -106,8 +103,7 @@ class Usuarios:
 
             if linha is None:
                 # Primeiro uso deste nome: cadastra agora, com a senha
-                # informada. Sem etapa separada de "criar conta" —
-                # decisão de design registrada no relatório.
+                # informada. Não há etapa separada de "criar conta".
                 salt = secrets.token_hex(TAMANHO_SALT_BYTES)
                 hash_senha = self._calcular_hash(salt, senha)
                 self._conexao.execute(

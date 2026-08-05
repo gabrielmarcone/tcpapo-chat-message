@@ -1,23 +1,19 @@
 """
-tests/test_cliente.py — Testes automatizados do cliente (Dev B, etapa 6).
-
-Dono: Desenvolvedor B.
+tests/test_cliente.py — Testes automatizados do cliente (cliente_app.py)
 
 Escopo:
-    - TestParseComando: cobre integralmente parse_comando() (etapa 4),
-      que é a lógica com maior densidade de regras de negócio no
-      cliente e, por ser uma função pura (sem socket, sem I/O), não
-      precisa de mocks.
-    - TestEnviar: cobre enviar() (etapa 5) com um socket mockado
-      (unittest.mock), validando que cada tipo de falha de rede é
-      tratado sem levantar exceção para quem chama.
+    - TestParseComando: cobre integralmente parse_comando(), que é a
+      lógica com maior densidade de regras de negócio no cliente e, por
+      ser uma função pura (sem socket, sem I/O), não precisa de mocks.
+    - TestEnviar: cobre enviar() com um socket mockado (unittest.mock),
+      validando que cada tipo de falha de rede é tratado sem levantar
+      exceção para quem chama.
 
 Não testamos aqui: conectar()/realizar_login()/main() fim-a-fim — essas
 funções terminam o processo (sys.exit) ou bloqueiam em input()/recv(),
 o que exigiria mocks bem mais elaborados para um ganho de cobertura
-pequeno perto do que já é validado manualmente com
-dev_tools/servidor_stub.py (ver TODO desse arquivo). Ficaria fora do
-escopo pedido para a etapa 6, que é o parser de comandos.
+pequeno perto do que já é validado com testes de integração reais
+(processo cliente + servidor) e com dev_tools/servidor_stub.py.
 """
 
 import contextlib
@@ -34,7 +30,7 @@ import protocolo  # noqa: E402
 
 
 class TestParseComandoTextoComum(unittest.TestCase):
-    """Item 19 da etapa 6: texto comum (sem '/') vira mensagem geral."""
+    """Texto comum (sem '/') vira mensagem geral."""
 
     def test_texto_simples_vira_mensagem_geral(self):
         acao, msg = cliente_app.parse_comando("oi pessoal")
@@ -42,13 +38,13 @@ class TestParseComandoTextoComum(unittest.TestCase):
         self.assertEqual(msg, protocolo.msg_mensagem_geral_enviar("oi pessoal"))
 
     def test_texto_com_espacos_extras_e_removido_das_pontas(self):
-        # Item 27: casos de borda — espaços extras nas pontas.
+        # Caso de borda: espaços extras nas pontas.
         acao, msg = cliente_app.parse_comando("   oi pessoal   ")
         self.assertEqual(acao, cliente_app.ACAO_ENVIAR)
         self.assertEqual(msg["texto"], "oi pessoal")
 
     def test_mensagem_vazia_e_ignorada(self):
-        # Item 27: caso de borda — mensagem vazia.
+        # Caso de borda: mensagem vazia.
         acao, msg = cliente_app.parse_comando("")
         self.assertEqual(acao, cliente_app.ACAO_VAZIO)
         self.assertIsNone(msg)
@@ -59,7 +55,7 @@ class TestParseComandoTextoComum(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_texto_com_quebra_de_linha_no_final_e_tratado_como_texto_simples(self):
-        # Item 26: texto contendo '\n' — normalmente input() já retira o
+        # Texto contendo '\n' — normalmente input() já retira o
         # '\n' final sozinho, mas parse_comando não deve depender disso:
         # o .strip() interno cobre esse caso também.
         acao, msg = cliente_app.parse_comando("oi pessoal\n")
@@ -67,7 +63,7 @@ class TestParseComandoTextoComum(unittest.TestCase):
         self.assertEqual(msg["texto"], "oi pessoal")
 
     def test_texto_com_quebra_de_linha_interna_e_preservada(self):
-        # Item 26: '\n' NO MEIO do texto (ex: colado de outro lugar) não
+        # '\n' no meio do texto (ex: colado de outro lugar) não
         # é removido — só as pontas são tratadas por .strip(). O texto
         # em si segue livre; framing de linha é responsabilidade de
         # protocolo.py, não de parse_comando().
@@ -77,7 +73,7 @@ class TestParseComandoTextoComum(unittest.TestCase):
 
 
 class TestParseComandoPriv(unittest.TestCase):
-    """Item 20: /priv <usuario> <mensagem>."""
+    """/priv <usuario> <mensagem>."""
 
     def test_priv_valido(self):
         acao, msg = cliente_app.parse_comando("/priv alice oi tudo bem?")
@@ -102,14 +98,14 @@ class TestParseComandoPriv(unittest.TestCase):
         self.assertIsNone(msg)
 
     def test_priv_com_mensagem_so_espacos_e_invalido(self):
-        # Item 27: caso de borda — argumento presente mas vazio na prática.
+        # Caso de borda: argumento presente mas vazio na prática.
         acao, msg = cliente_app.parse_comando("/priv alice    ")
         self.assertEqual(acao, cliente_app.ACAO_INVALIDO)
         self.assertIsNone(msg)
 
 
 class TestParseComandoLista(unittest.TestCase):
-    """Item 21: /lista."""
+    """/lista."""
 
     def test_lista_valido(self):
         acao, msg = cliente_app.parse_comando("/lista")
@@ -123,7 +119,7 @@ class TestParseComandoLista(unittest.TestCase):
 
 
 class TestParseComandoEntrar(unittest.TestCase):
-    """Item 22: /entrar <sala>."""
+    """/entrar <sala>."""
 
     def test_entrar_valido(self):
         acao, msg = cliente_app.parse_comando("/entrar jogos")
@@ -142,7 +138,7 @@ class TestParseComandoEntrar(unittest.TestCase):
 
 
 class TestParseComandoSairSala(unittest.TestCase):
-    """Item 23: /sair_sala."""
+    """/sair_sala."""
 
     def test_sair_sala_valido(self):
         acao, msg = cliente_app.parse_comando("/sair_sala")
@@ -196,7 +192,7 @@ class TestParseComandoHistorico(unittest.TestCase):
 
 
 class TestParseComandoSair(unittest.TestCase):
-    """Item 24: /sair."""
+    """/sair."""
 
     def test_sair_valido(self):
         acao, msg = cliente_app.parse_comando("/sair")
@@ -343,7 +339,7 @@ class TestCorDoUsuario(unittest.TestCase):
 
 
 class TestParseComandoInvalido(unittest.TestCase):
-    """Item 25: comandos desconhecidos/malformados."""
+    """Comandos desconhecidos/malformados."""
 
     def test_comando_desconhecido(self):
         acao, msg = cliente_app.parse_comando("/naoexiste")
@@ -357,7 +353,7 @@ class TestParseComandoInvalido(unittest.TestCase):
 
 
 class TestValidarPorta(unittest.TestCase):
-    """Etapa 5: validação de --porta (usada pelo argparse)."""
+    """Validação de --porta (usada pelo argparse)."""
 
     def test_porta_valida(self):
         self.assertEqual(cliente_app.validar_porta("5000"), 5000)
@@ -377,8 +373,8 @@ class TestValidarPorta(unittest.TestCase):
 
 class TestEnviar(unittest.TestCase):
     """
-    Etapa 5: enviar() não deve nunca deixar uma exceção de rede escapar
-    para quem chama — sempre retorna True/False. Usa um socket mockado
+    enviar() não deve nunca deixar uma exceção de rede escapar para quem
+    chama — sempre retorna True/False. Usa um socket mockado
     (unittest.mock), já que não queremos um socket TCP real neste teste.
     """
 
@@ -415,10 +411,10 @@ class TestEnviar(unittest.TestCase):
 
 class TestConectarErros(unittest.TestCase):
     """
-    Etapa 5: conectar() encerra o processo (sys.exit) com mensagem
-    amigável para cada tipo de falha, em vez de deixar a exceção subir
-    crua. Testamos isso patchando socket.socket para devolver um mock
-    cujo connect() levanta a exceção desejada.
+    conectar() encerra o processo (sys.exit) com mensagem amigável para
+    cada tipo de falha, em vez de deixar a exceção subir crua. Testamos
+    isso patchando socket.socket para devolver um mock cujo connect()
+    levanta a exceção desejada.
     """
 
     def _testar_erro_de_connect(self, excecao):

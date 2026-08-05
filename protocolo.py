@@ -1,64 +1,19 @@
 """
 protocolo.py — Protocolo de aplicação do chat (tcpapo-chat-message)
 
-Dono: CONJUNTO (Dev A e Dev B) — feito juntos, uma vez, no início.
-Depois de pronto e validado por tests/test_protocolo.py, este arquivo fica
-CONGELADO: qualquer alteração exige acordo explícito entre os dois.
+Define o conjunto de mensagens trocadas entre cliente e servidor, sua
+serialização em JSON e o framing usado para transmiti-las por um socket
+TCP, que não preserva limites de mensagem.
 
-Versão MESCLADA a partir de duas implementações independentes (Dev A e
-Dev B), reconciliando as diferenças entre elas. Decisões tomadas na fusão,
-para referência de ambos:
-
-    1. Exceção própria `ErroProtocolo` (ideia do Dev B) para qualquer
-       violação de forma da mensagem — seja ela originada localmente
-       (serializar() chamado com algo que não é uma mensagem válida) ou
-       vinda da rede (extrair_mensagens() recebendo uma linha que não é
-       um objeto JSON com 'tipo'). Um único tipo de exceção para "isto
-       não é uma mensagem de protocolo válida" simplifica quem consome
-       este módulo: um `except ErroProtocolo` cobre os dois sentidos.
-       `TypeError` é reservado só para engano de tipo Python na própria
-       chamada da função (ex: passar uma string em vez de bytes para
-       extrair_mensagens) — isso nunca pode vir da rede, só de uso
-       incorreto da API por quem programa.
-
-    2. `extrair_mensagens()` agora valida que toda mensagem extraída é um
-       dict com campo 'tipo' (string não vazia) — antes, uma das duas
-       versões deixava passar silenciosamente uma mensagem malformada
-       (ex: JSON sem 'tipo', ou um array JSON solto), que só ia quebrar
-       mais adiante, longe da causa real. A validação usa a mesma função
-       interna que serializar() usa, então a regra é idêntica nos dois
-       sentidos.
-
-    3. Nomes das funções construtoras de mensagem_geral/mensagem_privada
-       adotados do Dev B (`_enviar` / `_repassar`) — descrevem a ação
-       (o que a função faz) em vez de só o ator (quem chama), o que lê
-       melhor no ponto de uso.
-
-    4. Formato de `msg_lista_usuarios` adotado do Dev A: lista de objetos
-       {"nome": ..., "sala": ...} em vez de pares posicionais
-       [nome, sala]. Um pouco mais verboso no fio, mas auto-descritivo e
-       resistente a mudança futura de ordem ou adição de campo — quem
-       consome não precisa saber de cor que o índice 0 é nome.
-
-    5. Tolerância a "\r\n" (residual de CRLF) mantida explicitamente
-       (Dev A), mesmo que testes tenham confirmado que json.loads já
-       ignora esse "\r" como espaço em branco final por conta própria —
-       é uma linha de código a mais, mas remove qualquer dependência
-       desse comportamento não documentado do parser.
-
-Responsabilidade:
-    - Definir os tipos de mensagem trocados entre cliente e servidor,
-      conforme a tabela da seção 8.3 da Especificação de Arquitetura.
+Responsabilidades:
+    - Definir os tipos de mensagem e os campos que cada um exige,
+      conforme a Especificação de Arquitetura do projeto.
     - Serializar mensagens: dict -> uma linha de texto JSON terminada em "\n".
-    - Desserializar mensagens a partir de um buffer de bytes acumulado
-      (framing por delimitador de linha), validando a forma de cada uma.
+    - Desserializar mensagens a partir de um buffer de bytes acumulado,
+      validando a forma de cada uma.
 
-Usado por:
-    - servidor.py e dev_tools/cliente_stub.py (Dev A)
-    - cliente_app.py e dev_tools/servidor_stub.py (Dev B)
-
-Todos os quatro pontos acima DEVEM importar e usar as funções deste módulo
-— nunca montar ou interpretar JSON manualmente em outro lugar do projeto.
+Nenhuma outra parte do projeto deve montar ou interpretar JSON
+manualmente — sempre usar as funções deste módulo.
 
 Uso típico do framing, dentro do loop de leitura de uma conexão:
 
@@ -70,11 +25,8 @@ Uso típico do framing, dentro do loop de leitura de uma conexão:
         buffer += dados
         try:
             mensagens, buffer = extrair_mensagens(buffer)
-        except ErroProtocolo as erro:
-            # decisão de quem chama: logar e ignorar, ou encerrar a
-            # conexão — ver servidor.py / cliente_app.py para a escolha
-            # feita em cada caso.
-            ...
+        except ErroProtocolo:
+            ...  # decisão de quem chama: ignorar a linha ou encerrar a conexão
         for msg in mensagens:
             processar(msg)
 """
@@ -87,29 +39,26 @@ ENCODING = "utf-8"
 
 class ErroProtocolo(Exception):
     """
-    Mensagem que não segue o formato mínimo do protocolo: não é um objeto
-    JSON, ou é um objeto sem o campo obrigatório 'tipo' (string não
-    vazia). Levantada tanto por serializar() (uso local incorreto) quanto
-    por extrair_mensagens() (dado malformado vindo da rede) — ver decisão
-    1 no docstring do módulo.
+    Levantada quando uma mensagem não segue o formato mínimo do
+    protocolo: não é um objeto JSON, ou não tem um campo 'tipo' (string
+    não vazia). Cobre tanto o uso local incorreto (serializar() chamado
+    com algo inválido) quanto dado malformado vindo da rede
+    (extrair_mensagens()).
 
     Quando levantada por extrair_mensagens() no meio do processamento de
-    um buffer com mais de uma mensagem, carrega dois atributos extras
-    para que quem chama não perca o progresso já feito (bug encontrado
-    via teste de integração: sem isso, a linha malformada nunca era
-    consumida do buffer, e o servidor ficava preso reprocessando a mesma
-    linha ruim para sempre, nunca alcançando mensagens válidas seguintes):
+    um buffer com mais de uma mensagem, carrega o progresso já feito,
+    para que a linha malformada possa ser descartada sem impedir o
+    processamento das mensagens válidas antes e depois dela:
 
-        mensagens_processadas: lista de mensagens válidas já extraídas
-            ANTES da linha que causou o erro — podem ser processadas
-            normalmente por quem chama.
-        buffer_restante: o que sobra do buffer imediatamente APÓS a linha
-            malformada (que já foi descartada) — pronto para uma nova
-            chamada a extrair_mensagens, sem reprocessar a linha ruim.
+        mensagens_processadas: mensagens válidas já extraídas antes da
+            linha que causou o erro.
+        buffer_restante: o que sobra do buffer logo após a linha
+            malformada (já descartada), pronto para uma nova chamada a
+            extrair_mensagens sem reprocessar a linha ruim.
 
-    Quando levantada por serializar() (que não tem conceito de "buffer"),
-    esses atributos ficam com seus valores padrão (lista vazia / bytes
-    vazios) e podem ser ignorados.
+    Quando levantada por serializar() — que não tem conceito de buffer
+    — esses atributos ficam com seus valores padrão e podem ser
+    ignorados.
     """
 
     def __init__(self, mensagem: str, mensagens_processadas=None, buffer_restante: bytes = b""):
@@ -119,7 +68,7 @@ class ErroProtocolo(Exception):
 
 
 # --------------------------------------------------------------------------
-# Constantes de tipo de mensagem (seção 8.3 da Especificação de Arquitetura)
+# Tipos de mensagem
 # --------------------------------------------------------------------------
 
 # Cliente -> Servidor
@@ -140,11 +89,10 @@ TIPO_NOTIFICACAO = "notificacao"
 TIPO_ERRO = "erro"
 TIPO_HISTORICO_RESPOSTA = "historico_resposta"
 
-# TIPO_MENSAGEM_GERAL e TIPO_MENSAGEM_PRIVADA são reutilizados nos dois
-# sentidos (seção 8.3, observação de design) — o que muda é o conjunto de
-# campos presentes, não o nome do tipo. Por isso existem duas funções
-# construtoras para cada um (uma por direção), em vez de uma função única
-# com campo opcional — evita esquecer um campo obrigatório de um lado.
+# TIPO_MENSAGEM_GERAL e TIPO_MENSAGEM_PRIVADA são reaproveitados nos dois
+# sentidos — o que muda é o conjunto de campos presentes, não o nome do
+# tipo. Por isso existe uma função construtora para cada direção, em vez
+# de uma função única com campos opcionais.
 
 
 # --------------------------------------------------------------------------
@@ -153,10 +101,10 @@ TIPO_HISTORICO_RESPOSTA = "historico_resposta"
 
 def _validar_mensagem(mensagem: Any, origem: str) -> None:
     """
-    Valida que `mensagem` tem o formato mínimo exigido por todo o
-    protocolo: um objeto (dict) com um campo 'tipo' que seja uma string
-    não vazia. `origem` é só para a mensagem de erro indicar onde a
-    violação foi detectada (serializar ou extrair_mensagens).
+    Valida que `mensagem` tem o formato mínimo exigido pelo protocolo:
+    um objeto (dict) com um campo 'tipo' que seja uma string não vazia.
+    `origem` identifica, na mensagem de erro, onde a violação foi
+    detectada (serializar ou extrair_mensagens).
     """
     if not isinstance(mensagem, dict):
         raise ErroProtocolo(
@@ -179,7 +127,7 @@ def serializar(mensagem: dict) -> bytes:
     já codificada em bytes e terminada por '\n'.
 
     Levanta ErroProtocolo se a mensagem não for um dict com campo 'tipo'
-    válido — é melhor falhar alto e claro no ponto de montagem da
+    válido — é melhor falhar de forma clara no ponto de montagem da
     mensagem do que enviar algo inválido pela rede.
     """
     _validar_mensagem(mensagem, origem="serializar")
@@ -247,9 +195,9 @@ def extrair_mensagens(buffer: bytes) -> tuple[list, bytes]:
         try:
             _validar_mensagem(mensagem, origem="extrair_mensagens")
         except ErroProtocolo as erro:
-            # _validar_mensagem não sabe de buffer/progresso (é usada
-            # também por serializar) — reempacota aqui com o contexto de
-            # recuperação, sem duplicar a lógica de validação.
+            # _validar_mensagem não conhece o conceito de buffer (é usada
+            # também por serializar) — reempacota aqui com o progresso já
+            # feito, sem duplicar a lógica de validação.
             raise ErroProtocolo(
                 str(erro), mensagens_processadas=mensagens, buffer_restante=buffer
             ) from erro
@@ -262,9 +210,9 @@ def extrair_mensagens(buffer: bytes) -> tuple[list, bytes]:
 # --------------------------------------------------------------------------
 # Funções auxiliares de construção de mensagem
 # --------------------------------------------------------------------------
-# Cada função monta exatamente os campos que a seção 8.3 define para
-# aquele tipo/direção — reduz erro de digitação de chave em cada ponto de
-# chamada e documenta, pelo próprio nome, a direção e os campos exigidos.
+# Cada função monta exatamente os campos exigidos para aquele tipo e
+# direção — reduz erro de digitação de chave em cada ponto de chamada e
+# documenta, pelo próprio nome, a direção e os campos esperados.
 
 # --- Cliente -> Servidor ---
 
@@ -300,10 +248,10 @@ def msg_sair() -> dict:
 
 def msg_historico(limite: Optional[int] = None) -> dict:
     """
-    Pede o histórico recente de mensagens gerais da SALA ATUAL do
-    remetente — mesmo princípio de mensagem_geral (seção 8.3): quem
-    decide o escopo é o servidor, a partir do estado interno dele, não
-    um dado que o cliente escolhe e manda junto.
+    Pede o histórico recente de mensagens gerais da sala atual do
+    remetente — mesmo princípio de mensagem_geral: quem decide o escopo
+    é o servidor, a partir do estado interno dele, não um dado que o
+    cliente escolhe e manda junto.
 
     `limite` é opcional; se omitido, o servidor aplica um padrão
     razoável (e também um teto máximo, para não permitir pedir a tabela
@@ -343,8 +291,9 @@ def msg_lista_usuarios(usuarios: list) -> dict:
     """
     usuarios: lista de pares (nome, sala), ex: [("alice", "geral"), ("bob", "jogos")]
 
-    Serializado como lista de objetos {"nome": ..., "sala": ...} — decisão
-    tomada na fusão das duas versões (ver item 4 no docstring do módulo).
+    Serializado como lista de objetos {"nome": ..., "sala": ...} — mais
+    verboso que uma lista de pares posicionais, mas auto-descritivo e
+    resistente a mudança futura de ordem ou adição de campo.
     """
     return {
         "tipo": TIPO_LISTA_USUARIOS,

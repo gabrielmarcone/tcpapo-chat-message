@@ -631,13 +631,22 @@ def _limpar_tela() -> Tuple[str, None]:
     no servidor (SQLite) e pode ser consultado a qualquer momento com
     /historico, mesmo depois de limpar a tela.
 
-    Sequência ANSI de limpeza só é enviada se a saída for um terminal
-    de verdade (_USAR_COR) -- em saída redirecionada/capturada por
-    teste, os bytes de controle não fariam sentido nenhum e só
-    sujariam o resultado.
+    A sequência ANSI usada tem três partes, nesta ordem:
+        \\033[2J -> limpa a tela visível
+        \\033[3J -> limpa também o buffer de rolagem (scrollback) —
+                    sem essa parte, o conteúdo antigo continua existindo
+                    e reaparece se o usuário rolar a tela pra cima; é
+                    justamente essa parte que faz a limpeza ser de
+                    verdade, e não só um "empurrão" visual do conteúdo
+                    antigo para fora da área visível.
+        \\033[H  -> move o cursor de volta para o topo
+
+    Sequência só é enviada se a saída for um terminal de verdade
+    (_USAR_COR) -- em saída redirecionada/capturada por teste, os bytes
+    de controle não fariam sentido nenhum e só sujariam o resultado.
     """
     if _USAR_COR:
-        print("\033[2J\033[H", end="")
+        print("\033[2J\033[3J\033[H", end="")
         _info("tela limpa — o histórico do servidor continua intacto (use /historico para consultá-lo).")
     else:
         _aviso(f"{COMANDO_LIMPAR} não tem efeito quando a saída não é um terminal.")

@@ -20,6 +20,9 @@ dev_tools/servidor_stub.py (ver TODO desse arquivo). Ficaria fora do
 escopo pedido para a etapa 6, que é o parser de comandos.
 """
 
+import contextlib
+import io
+import os
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -206,6 +209,139 @@ class TestParseComandoSair(unittest.TestCase):
         self.assertIsNone(msg)
 
 
+class TestParseComandoCafeEasterEgg(unittest.TestCase):
+    """/cafe — comando secreto, 100% local (não manda nada ao servidor)."""
+
+    def test_cafe_nao_envia_nada_ao_servidor(self):
+        acao, msg = cliente_app.parse_comando("/cafe")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_cafe_case_insensitive(self):
+        acao, msg = cliente_app.parse_comando("/CAFE")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_cafe_nao_aparece_na_ajuda(self):
+        """Parte do ponto de ser um easter egg: fica de fora da lista de
+        comandos que o cliente mostra ao conectar."""
+        self.assertNotIn(cliente_app.COMANDO_CAFE, cliente_app.TEXTO_AJUDA_COMANDOS)
+
+    def test_cafe_imprime_a_arte_e_nao_lanca_excecao(self):
+        # só confirma que roda sem quebrar e produz alguma saída --
+        # o conteúdo exato da arte é só estético, não vale testar
+        # caractere por caractere.
+        with contextlib.redirect_stdout(io.StringIO()) as saida:
+            cliente_app.parse_comando("/cafe")
+        self.assertGreater(len(saida.getvalue()), 0)
+
+
+class TestParseComandoMinecraftEasterEgg(unittest.TestCase):
+    """/minecraft — mesmo raciocínio de /cafe: secreto e 100% local."""
+
+    def test_minecraft_nao_envia_nada_ao_servidor(self):
+        acao, msg = cliente_app.parse_comando("/minecraft")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_minecraft_case_insensitive(self):
+        acao, msg = cliente_app.parse_comando("/MINECRAFT")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_minecraft_nao_aparece_na_ajuda(self):
+        self.assertNotIn(cliente_app.COMANDO_MINECRAFT, cliente_app.TEXTO_AJUDA_COMANDOS)
+
+    def test_minecraft_imprime_a_arte_e_nao_lanca_excecao(self):
+        with contextlib.redirect_stdout(io.StringIO()) as saida:
+            cliente_app.parse_comando("/minecraft")
+        self.assertGreater(len(saida.getvalue()), 0)
+
+    def test_arte_do_creeper_tem_todas_as_linhas_do_mesmo_tamanho(self):
+        """Arte desalinhada (linhas de tamanhos diferentes) fica torta em
+        qualquer terminal — confirma que isso nunca acontece por acidente
+        numa edição futura."""
+        linhas = [l for l in cliente_app._ARTE_CREEPER.split("\n") if l]
+        larguras = {len(l) for l in linhas}
+        self.assertEqual(len(larguras), 1, f"linhas com tamanhos diferentes: {larguras}")
+
+
+class TestParseComandoBatmanEasterEgg(unittest.TestCase):
+    """/batman — mesmo raciocínio de /cafe: secreto e 100% local."""
+
+    def test_batman_nao_envia_nada_ao_servidor(self):
+        acao, msg = cliente_app.parse_comando("/batman")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_batman_case_insensitive(self):
+        acao, msg = cliente_app.parse_comando("/BATMAN")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_batman_nao_aparece_na_ajuda(self):
+        self.assertNotIn(cliente_app.COMANDO_BATMAN, cliente_app.TEXTO_AJUDA_COMANDOS)
+
+    def test_batman_imprime_a_arte_e_nao_lanca_excecao(self):
+        with contextlib.redirect_stdout(io.StringIO()) as saida:
+            cliente_app.parse_comando("/batman")
+        self.assertGreater(len(saida.getvalue()), 0)
+
+    def test_arte_do_morcego_tem_todas_as_linhas_do_mesmo_tamanho(self):
+        linhas = [l for l in cliente_app._ARTE_MORCEGO.split("\n") if l]
+        larguras = {len(l) for l in linhas}
+        self.assertEqual(len(larguras), 1, f"linhas com tamanhos diferentes: {larguras}")
+
+
+class TestCorDoUsuario(unittest.TestCase):
+    """Cor consistente por remetente (hash do nome), estilo IRC/Discord."""
+
+    def test_mesmo_nome_sempre_a_mesma_cor(self):
+        cor1 = cliente_app._cor_do_usuario("alice")
+        cor2 = cliente_app._cor_do_usuario("alice")
+        self.assertEqual(cor1, cor2)
+
+    def test_nomes_com_case_diferente_tem_a_mesma_cor(self):
+        """Mesma convenção do resto do sistema: 'Alice' e 'alice' são a
+        mesma pessoa (RegistroClientes, usuarios.py), logo a mesma cor."""
+        self.assertEqual(
+            cliente_app._cor_do_usuario("Alice"),
+            cliente_app._cor_do_usuario("alice"),
+        )
+        self.assertEqual(
+            cliente_app._cor_do_usuario("BOB"),
+            cliente_app._cor_do_usuario("bob"),
+        )
+
+    def test_cor_sempre_vem_da_paleta_de_usuario(self):
+        for nome in ("alice", "bob", "carol", "dave", "eve", "um_nome_bem_longo_qualquer"):
+            self.assertIn(cliente_app._cor_do_usuario(nome), cliente_app._Cor.USUARIO)
+
+    def test_estavel_entre_execucoes_simulando_hash_randomizado(self):
+        """
+        A cor não pode depender de hash() nativo do Python (que muda a
+        cada processo por causa de PYTHONHASHSEED aleatório) -- senão a
+        cor de 'alice' mudaria toda vez que o cliente fosse reiniciado.
+        Confirma isso rodando em dois subprocessos com seeds de hash
+        DIFERENTES de propósito e comparando o resultado.
+        """
+        import subprocess
+
+        codigo = (
+            "import sys; sys.path.insert(0, '.'); import cliente_app; "
+            "print(cliente_app._cor_do_usuario('alice'))"
+        )
+        resultado1 = subprocess.run(
+            [sys.executable, "-c", codigo],
+            capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": "1"},
+        )
+        resultado2 = subprocess.run(
+            [sys.executable, "-c", codigo],
+            capture_output=True, text=True, env={**os.environ, "PYTHONHASHSEED": "2"},
+        )
+        self.assertEqual(resultado1.stdout.strip(), resultado2.stdout.strip())
+
+
 class TestParseComandoInvalido(unittest.TestCase):
     """Item 25: comandos desconhecidos/malformados."""
 
@@ -306,6 +442,21 @@ class TestConectarErros(unittest.TestCase):
 
     def test_os_error_generico(self):
         self._testar_erro_de_connect(OSError("falha genérica"))
+
+
+class TestMensagensDeSistema(unittest.TestCase):
+    """
+    _ok/_erro/_aviso usam símbolo (✓ ✗ ⚠); _info especificamente foi
+    revertido de volta pro texto "[info]" a pedido — sem símbolo. Este
+    teste trava essa escolha, pra não voltar a mudar sem querer numa
+    edição futura.
+    """
+
+    def test_info_usa_texto_sem_simbolo(self):
+        with contextlib.redirect_stdout(io.StringIO()) as saida:
+            cliente_app._info("mensagem de teste")
+        self.assertIn("[info]", saida.getvalue())
+        self.assertNotIn("ℹ", saida.getvalue())
 
 
 if __name__ == "__main__":

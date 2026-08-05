@@ -63,6 +63,29 @@ class _Cor:
     MAGENTA = "\033[95m"
     CIANO = "\033[96m"
     NEGRITO = "\033[1m"
+    ITALICO = "\033[3m"
+    SUBLINHADO = "\033[4m"
+
+    # Paleta reservada só pra identidade de usuário (hash do nome -> cor),
+    # separada da paleta "semântica" acima (que já significa uma coisa
+    # fixa: vermelho = erro, amarelo = aviso/notificação, verde = ok,
+    # ciano = rótulo de lista/histórico). São as cores ANSI normais (não
+    # as "brilhantes" 90-97 usadas acima), pra nunca ficar visualmente
+    # igual a nenhuma cor semântica, mesmo lado a lado.
+    USUARIO = [
+        "\033[31m",  # vermelho
+        "\033[32m",  # verde
+        "\033[33m",  # amarelo/oliva
+        "\033[34m",  # azul
+        "\033[35m",  # magenta
+        "\033[36m",  # ciano
+    ]
+
+    # Cor fixa e reservada só para "você" — nunca sorteada pelo hash (ver
+    # _cor_do_usuario), pra sua própria mensagem ser sempre reconhecível
+    # de cara, em qualquer sala, mesmo se por coincidência ela combinasse
+    # com a cor de outro usuário.
+    VOCE = "\033[97m"  # branco brilhante
 
 
 _USAR_COR = sys.stdout.isatty()
@@ -87,16 +110,61 @@ def _hora() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+def _cor_do_usuario(nome: str) -> str:
+    """
+    Sempre a MESMA cor para o mesmo nome (estilo IRC/Discord antigo) —
+    faz uma sala cheia ficar muito mais fácil de acompanhar visualmente,
+    porque cada pessoa "tem uma cor" consistente do início ao fim da
+    conversa, em vez de tudo sair só em negrito branco.
+
+    casefold() de propósito: mesma convenção usada no resto do sistema
+    (RegistroClientes, usuarios.py) — "Alice" e "alice" são a MESMA
+    pessoa, então têm que sair com a MESMA cor.
+
+    Soma dos códigos dos caracteres (não hash() nativo do Python): hash()
+    de string muda a cada execução do processo por segurança
+    (PYTHONHASHSEED aleatório) — precisamos do oposto aqui, a cor tem que
+    ser estável entre sessões diferentes, não só dentro de uma.
+    """
+    indice = sum(ord(caractere) for caractere in nome.casefold()) % len(_Cor.USUARIO)
+    return _Cor.USUARIO[indice]
+
+
+def _estilo_do_usuario(nome: str) -> str:
+    """
+    Estilo completo (cor + negrito, e às vezes + sublinhado) para o nome
+    de um remetente. Com só 6 cores na paleta de identidade, uma sala
+    com mais de 6 pessoas ativas — ou até menos, por coincidência
+    (testado e confirmado: 3 nomes já bastaram pra dar colisão de cor)
+    — inevitavelmente repete cor entre duas pessoas diferentes.
+    Sublinhado como segunda dimensão dobra o espaço de combinações
+    distintas (6 cores × 2) sem sair de atributos ANSI básicos
+    (negrito=1, sublinhado=4) — os mais universalmente suportados, mais
+    seguro do que arriscar cores de 256 cores, que nem todo terminal
+    mais antigo entende direito.
+    """
+    espaco_total = len(_Cor.USUARIO) * 2
+    indice = sum(ord(caractere) for caractere in nome.casefold()) % espaco_total
+    cor = _Cor.USUARIO[indice % len(_Cor.USUARIO)]
+    sublinhado = _Cor.SUBLINHADO if indice >= len(_Cor.USUARIO) else ""
+    return _Cor.NEGRITO + cor + sublinhado
+
+
+def _c_nome(nome: str) -> str:
+    """Nome de um remetente, com o estilo consistente daquele nome."""
+    return _c(nome, _estilo_do_usuario(nome))
+
+
 def _ok(texto: str) -> None:
-    print(f"{_c('[ok]', _Cor.VERDE)} {texto}")
+    print(f"{_c('✓', _Cor.VERDE)} {texto}")
 
 
 def _erro(texto: str) -> None:
-    print(f"{_c('[erro]', _Cor.VERMELHO)} {texto}")
+    print(f"{_c('✗', _Cor.VERMELHO)} {texto}")
 
 
 def _aviso(texto: str) -> None:
-    print(f"{_c('[aviso]', _Cor.AMARELO)} {texto}")
+    print(f"{_c('⚠', _Cor.AMARELO)} {texto}")
 
 
 def _info(texto: str) -> None:
@@ -233,16 +301,16 @@ def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
 
     if tipo == protocolo.TIPO_MENSAGEM_GERAL:
         sala = _c(f"[{estado.sala_atual}]", _Cor.AZUL)
-        remetente = _c(msg.get("remetente", "?"), _Cor.NEGRITO)
+        remetente = _c_nome(msg.get("remetente", "?"))
         print(f"{hora} {sala} {remetente}: {msg.get('texto', '')}")
     elif tipo == protocolo.TIPO_MENSAGEM_PRIVADA:
         rotulo = _c("(privado)", _Cor.MAGENTA)
-        remetente = _c(msg.get("remetente", "?"), _Cor.NEGRITO)
+        remetente = _c_nome(msg.get("remetente", "?"))
         print(f"{hora} {rotulo} {remetente}: {msg.get('texto', '')}")
     elif tipo == protocolo.TIPO_NOTIFICACAO:
         print(f"{hora} {_c('»', _Cor.AMARELO)} {_c(msg.get('texto', ''), _Cor.AMARELO)}")
     elif tipo == protocolo.TIPO_ERRO:
-        print(f"{hora} {_c('[erro do servidor]', _Cor.VERMELHO)} {msg.get('motivo', '')}")
+        print(f"{hora} {_c('✗ [erro do servidor]', _Cor.VERMELHO)} {msg.get('motivo', '')}")
     elif tipo == protocolo.TIPO_LISTA_USUARIOS:
         # Adicionado na etapa 4: sem isso, a resposta de /lista caía no
         # "else" genérico abaixo e mostrava o dict cru na tela.
@@ -252,7 +320,7 @@ def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
             print("    nenhum usuário conectado.")
         else:
             for usuario in usuarios:
-                nome = _c(usuario.get("nome", "?"), _Cor.NEGRITO)
+                nome = _c_nome(usuario.get("nome", "?"))
                 sala = usuario.get("sala", "?")
                 print(f"    - {nome} ({sala})")
     elif tipo == protocolo.TIPO_HISTORICO_RESPOSTA:
@@ -270,13 +338,38 @@ def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
         else:
             for item in mensagens_historico:
                 hora_item = _c(f"[{item.get('hora', '?')}]", _Cor.CINZA)
-                remetente_item = _c(item.get("remetente", "?"), _Cor.NEGRITO)
+                remetente_item = _c_nome(item.get("remetente", "?"))
                 print(f"    {hora_item} {remetente_item}: {item.get('texto', '')}")
     else:
         # Tipo não tratado ainda (não deveria acontecer, dado o contrato
         # fechado de protocolo.py). Não inventamos formatação para campos
         # que não conhecemos — só exibimos bruto.
         print(f"{hora} [{tipo}] {msg}")
+
+
+def _imprimir_minha_mensagem_geral(estado: EstadoCliente, texto: str) -> None:
+    """
+    Confirmação formatada da PRÓPRIA mensagem geral, logo após enviar —
+    o servidor nunca ecoa de volta a mensagem pra quem mandou (ver seção
+    5 do protocolo), então sem isso a única coisa na tela seria o eco
+    cru do terminal (o que você literalmente digitou), sem hora, sala
+    ou nenhuma formatação — bem diferente de como as mensagens dos
+    outros aparecem. "você" usa sempre a MESMA cor reservada (_Cor.VOCE),
+    nunca a cor "sorteada" por hash — assim sua própria fala é
+    reconhecível de cara, mesmo numa sala cheia de gente colorida.
+    """
+    hora = _c(f"[{_hora()}]", _Cor.CINZA)
+    sala = _c(f"[{estado.sala_atual}]", _Cor.AZUL)
+    voce = _c("você", _Cor.NEGRITO + _Cor.VOCE)
+    print(f"{hora} {sala} {voce}: {texto}")
+
+
+def _imprimir_minha_mensagem_privada(destinatario: str, texto: str) -> None:
+    hora = _c(f"[{_hora()}]", _Cor.CINZA)
+    rotulo = _c("(privado)", _Cor.MAGENTA)
+    voce = _c("você", _Cor.NEGRITO + _Cor.VOCE)
+    alvo = _c_nome(destinatario)
+    print(f"{hora} {rotulo} {voce} → {alvo}: {texto}")
 
 
 # --------------------------------------------------------------------------
@@ -524,6 +617,9 @@ COMANDO_ENTRAR = "/entrar"
 COMANDO_SAIR_SALA = "/sair_sala"
 COMANDO_SAIR = "/sair"
 COMANDO_HISTORICO = "/historico"
+COMANDO_CAFE = "/cafe"  # easter egg -- de propósito NÃO entra em TEXTO_AJUDA_COMANDOS
+COMANDO_MINECRAFT = "/minecraft"  # idem
+COMANDO_BATMAN = "/batman"  # idem
 
 TEXTO_AJUDA_COMANDOS = (
     f"  {COMANDO_PRIV} <usuario> <mensagem>   envia mensagem privada\n"
@@ -535,12 +631,75 @@ TEXTO_AJUDA_COMANDOS = (
     "  <texto livre>                  mensagem para o chat geral"
 )
 
+_ARTE_CAFE = r"""
+          ( (
+           ) )
+        ........
+        |      |]
+        \      /
+         `----'"""
+
+
+def _mostrar_easter_egg_cafe() -> Tuple[str, None]:
+    """
+    Easter egg — /cafe, comando secreto (de propósito fora da lista de
+    ajuda). 100% local: não manda nada pro servidor, não precisa de
+    nenhuma mudança em protocolo.py nem servidor.py, então zero risco
+    pras funcionalidades de verdade — só um agrado na hora da
+    demonstração. Reaproveita ACAO_VAZIO (mesma "ação" de uma linha em
+    branco: nada a enviar, nada mais a fazer).
+    """
+    print(_c(_ARTE_CAFE, _Cor.AMARELO))
+    print(f"  {_c('☕ pausa pro café — volta já!', _Cor.AMARELO + _Cor.NEGRITO)}")
+    return ACAO_VAZIO, None
+
+
+_ARTE_CREEPER = "\n".join([
+    "",
+    "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓",
+    "▓▓░░░░▓▓▓▓░░░░▓▓",
+    "▓▓░░░░▓▓▓▓░░░░▓▓",
+    "▓▓▓▓▓▓░░░░▓▓▓▓▓▓",
+    "▓▓▓▓░░░░░░░░▓▓▓▓",
+    "▓▓▓▓░░░░░░░░▓▓▓▓",
+    "▓▓▓▓░░▓▓▓▓░░▓▓▓▓",
+    "▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓",
+])
+
+
+def _mostrar_easter_egg_minecraft() -> Tuple[str, None]:
+    """Easter egg — /minecraft. Mesmo raciocínio de _mostrar_easter_egg_cafe."""
+    print(_c(_ARTE_CREEPER, _Cor.VERDE))
+    print(f"  {_c('sssss... BOOM! (era só um creeper, relaxa)', _Cor.VERDE + _Cor.NEGRITO)}")
+    return ACAO_VAZIO, None
+
+
+_ARTE_MORCEGO = "\n".join([
+    "",
+    "    ⠀⠀⢀⣀⡠⠤⠤⠴⠶⠶⠶⠶⠦⠤⠤⢄⣀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "   ⣠⠖⢛⣩⣤⠂⠀⠀⠀⣶⡀⢀⣶⠀⠀⠀⠐⣤⣍⡛⠲⣄⠀⠀⠀⠀",
+    "⢀⡴⢋⣴⣾⣿⣿⣿⠀⠀⠀⠀⣿⣿⣿⣿⠀⠀⠀⠀⣿⣿⣿⣷⣦⡙⢦⡀⠀",
+    "⡞⢠⣿⣿⣿⣿⣿⣿⣷⣤⣤⣴⣿⣿⣿⣿⣦⣤⣤⣾⣿⣿⣿⣿⣿⣿⡆⢳⠀",
+    "⡁⢻⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠀⠆",
+    "⢧⡈⢿⣿⣿⣿⠿⠿⣿⡿⠿⠿⣿⣿⣿⣿⠿⠿⢿⣿⠿⠿⣿⣿⣿⡿⢁⡼⠀",
+    "⠀⠳⢄⡙⠿⣇⠀⠀⠈⠁⠀⠀⠈⢿⡿⠁⠀⠀⠈⠁⠀⠀⣸⠿⢋⡠⠞⠀⠀",
+    "⠀⠀⠀⠉⠲⢤⣀⡀⠀⠀⠀⠀⠀⠀⠁⠀⠀⠀⠀⠀⢀⣀⡤⠖⠉⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠈⠉⠉⠐⠒⠒⠒⠒⠒⠒⠒⠒⠒⠉⠉⠁⠀⠀⠀⠀⠀⠀⠀",
+])
+
+
+def _mostrar_easter_egg_batman() -> Tuple[str, None]:
+    """Easter egg — /batman. Mesmo raciocínio de _mostrar_easter_egg_cafe."""
+    print(_c(_ARTE_MORCEGO, _Cor.CINZA))
+    print(f"  {_c('🦇 ele vigia o código, nas sombras da noite.', _Cor.CINZA + _Cor.NEGRITO)}")
+    return ACAO_VAZIO, None
+
 
 def _comando_invalido(uso: str) -> Tuple[str, None]:
     """Imprime a mensagem de ajuda para um comando malformado e devolve o
     par (ACAO_INVALIDO, None) que parse_comando() deve retornar. Nenhuma
     mensagem é enviada ao servidor nesse caso."""
-    print(f"{_c('[uso]', _Cor.AMARELO)} {uso}")
+    print(f"{_c('⚠ [uso]', _Cor.AMARELO)} {uso}")
     return ACAO_INVALIDO, None
 
 
@@ -618,6 +777,15 @@ def parse_comando(texto: str) -> Tuple[str, Optional[dict]]:
         if resto:
             return _comando_invalido(f"{COMANDO_SAIR} não aceita argumentos")
         return ACAO_SAIR, None
+
+    if comando == COMANDO_CAFE:
+        return _mostrar_easter_egg_cafe()
+
+    if comando == COMANDO_MINECRAFT:
+        return _mostrar_easter_egg_minecraft()
+
+    if comando == COMANDO_BATMAN:
+        return _mostrar_easter_egg_batman()
 
     return _comando_invalido(f"comando desconhecido '{comando}'")
 
@@ -737,6 +905,14 @@ def main() -> None:
                 estado.sala_atual = mensagem["sala"]
             elif mensagem["tipo"] == protocolo.TIPO_SAIR_SALA:
                 estado.sala_atual = "geral"
+            elif mensagem["tipo"] == protocolo.TIPO_MENSAGEM_GERAL:
+                # O servidor nunca ecoa a mensagem geral de volta pra
+                # quem mandou — sem isso, a única coisa na tela seria o
+                # eco cru do input(), sem hora/sala/formatação nenhuma,
+                # bem diferente de como a mensagem dos outros aparece.
+                _imprimir_minha_mensagem_geral(estado, mensagem["texto"])
+            elif mensagem["tipo"] == protocolo.TIPO_MENSAGEM_PRIVADA:
+                _imprimir_minha_mensagem_privada(mensagem["destinatario"], mensagem["texto"])
     except KeyboardInterrupt:
         _info("encerrando (Ctrl+C)...")
     finally:

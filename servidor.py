@@ -724,6 +724,28 @@ def loop_accept(
         thread.start()
 
 
+def _resolver_caminho_banco(banco_explicito: Optional[str], porta_real: int) -> str:
+    """
+    Decide o caminho do arquivo SQLite do histórico de mensagens.
+
+    Se o usuário passou --banco explicitamente, usa exatamente esse
+    valor — de propósito, isso permite até compartilhar histórico entre
+    execuções diferentes, se alguém quiser fazer isso por escolha.
+
+    Caso contrário, isola automaticamente por porta (chat_historico_
+    <porta>.db). Bug real encontrado: duas instâncias do servidor em
+    portas DIFERENTES, nenhuma delas usando --banco, acabavam lendo e
+    escrevendo no MESMO arquivo (o nome padrão era fixo, sem relação
+    nenhuma com a porta) — mensagens de um servidor apareciam no
+    /historico do outro, mesmo sendo processos e portas completamente
+    diferentes. Isolar por porta por padrão elimina essa surpresa sem
+    tirar a flexibilidade de quem quiser um arquivo específico.
+    """
+    if banco_explicito is not None:
+        return banco_explicito
+    return f"chat_historico_{porta_real}.db"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Servidor do chat tcpapo-chat-message")
     parser.add_argument(
@@ -735,8 +757,11 @@ def main() -> None:
     parser.add_argument(
         "--banco",
         type=str,
-        default=CAMINHO_BANCO_PADRAO,
-        help=f"Arquivo SQLite para o historico de mensagens (padrao: {CAMINHO_BANCO_PADRAO})",
+        default=None,
+        help=(
+            "Arquivo SQLite para o historico de mensagens (padrao: "
+            "isolado automaticamente por porta, chat_historico_<porta>.db)"
+        ),
     )
     parser.add_argument(
         "--banco-usuarios",
@@ -763,12 +788,19 @@ def main() -> None:
         # endereço de soquete...") não ajuda o usuário e só polui a tela
         # — a dica logo abaixo já diz o que fazer.
         print(f"{_c('[erro]', _Cor.VERMELHO)} não foi possível iniciar o servidor na porta {args.porta} — já está em uso.")
-        print(f"{_c('[dica]', _Cor.CINZA)} tente outra porta (--porta) ou encerre o processo que já está usando essa.")
-        historico.fechar()
+        print(f"{_c('[dica]', _Cor.CINZA)} tente outra porta (--porta) ou encerre o processo que já está usando essa.")        
         usuarios.fechar()
         sys.exit(1)
 
-    print(f"{_prefixo_hora()} {_c('Servidor escutando em', _Cor.VERDE)} {HOST_PADRAO}:{args.porta} (Ctrl+C para encerrar)")
+    # A porta REAL (não a pedida) — importante quando --porta 0 é usado
+    # (deixa o SO escolher): sem isso, tanto a mensagem de "escutando em"
+    # quanto o nome do arquivo de histórico isolado por porta mostrariam
+    # "0" em vez da porta de verdade que o SO escolheu.
+    porta_real = socket_servidor.getsockname()[1]
+
+    historico = Historico(_resolver_caminho_banco(args.banco, porta_real))
+
+    print(f"{_prefixo_hora()} {_c('Servidor escutando em', _Cor.VERDE)} {HOST_PADRAO}:{porta_real} (Ctrl+C para encerrar)")
 
     try:
         loop_accept(socket_servidor, registro, historico, usuarios)

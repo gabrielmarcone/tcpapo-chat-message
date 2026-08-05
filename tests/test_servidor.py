@@ -1338,6 +1338,147 @@ def test_main_le_porta_via_argumento_e_nao_bloqueia(monkeypatch, capsys):
     assert "Servidor escutando em" in saida
 
 
+# --------------------------------------------------------------------------
+# Isolamento do histórico por porta (bug real: duas instâncias em portas
+# diferentes, sem --banco, liam/escreviam no mesmo arquivo padrão fixo)
+# --------------------------------------------------------------------------
+
+def test_resolver_caminho_banco_sem_banco_explicito_isola_por_porta():
+    assert servidor._resolver_caminho_banco(None, 34567) == "chat_historico_34567.db"
+    assert servidor._resolver_caminho_banco(None, 34568) == "chat_historico_34568.db"
+
+
+def test_resolver_caminho_banco_com_banco_explicito_ignora_a_porta():
+    """
+    --banco explícito sempre vence, independente da porta — preserva a
+    flexibilidade de quem QUISER compartilhar histórico entre execuções
+    de propósito (ou usar :memory: nos testes, como já fazemos).
+    """
+    assert servidor._resolver_caminho_banco("meu_arquivo.db", 34567) == "meu_arquivo.db"
+    assert servidor._resolver_caminho_banco(":memory:", 9999) == ":memory:"
+
+
+def test_main_sem_banco_explicito_usa_arquivo_isolado_pela_porta_real(monkeypatch, capsys, tmp_path):
+    """
+    Ponta a ponta (com Historico de verdade, não mockado): rodando main()
+    SEM --banco, o arquivo criado no disco precisa ter o nome baseado na
+    porta REAL que o socket usou — não na porta pedida (importante para
+    --porta 0, onde o SO escolhe).
+    """
+    monkeypatch.chdir(tmp_path)
+
+    def loop_accept_fake(_sock_servidor, _registro, _historico):
+        pass  # não precisa aceitar conexão nenhuma pra este teste
+
+    monkeypatch.setattr(servidor, "loop_accept", loop_accept_fake)
+    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "0"])  # sem --banco de propósito
+
+    servidor.main()
+
+    arquivos_db = list(tmp_path.glob("chat_historico_*.db"))
+    assert len(arquivos_db) == 1, f"esperava exatamente 1 arquivo, achei: {arquivos_db}"
+    # a porta real (escolhida pelo SO) nunca é 0 — se o nome do arquivo
+    # fosse "chat_historico_0.db", seria a porta PEDIDA vazando no nome
+    # em vez da porta REAL usada
+    assert arquivos_db[0].name != "chat_historico_0.db"
+
+
+def test_dois_servidores_em_portas_diferentes_sem_banco_nao_compartilham_historico(tmp_path, monkeypatch):
+    """
+    Reprodução direta do bug relatado: dois processos reais de
+    servidor.py, cada um numa porta diferente, nenhum usando --banco —
+    antes da correção, os dois liam/escreviam no mesmo
+    'chat_historico.db' (nome fixo); agora cada porta tem seu próprio
+    arquivo, então uma mensagem enviada num não aparece no /historico
+    do outro.
+    """
+    monkeypatch.chdir(tmp_path)
+
+    registro1 = RegistroClientes()
+    historico1 = Historico(servidor._resolver_caminho_banco(None, 50001))
+    sock1 = servidor.criar_socket_servidor("127.0.0.1", 50001)
+    thread1 = threading.Thread(target=servidor.loop_accept, args=(sock1, registro1, historico1), daemon=True)
+    thread1.start()
+
+    registro2 = RegistroClientes()
+    historico2 = Historico(servidor._resolver_caminho_banco(None, 50002))
+    sock2 = servidor.criar_socket_servidor("127.0.0.1", 50002)
+    thread2 = threading.Thread(target=servidor.loop_accept, args=(sock2, registro2, historico2), daemon=True)
+    thread2.start()
+
+    try:
+        alice = ClienteDeTeste(50001)
+        alice.enviar(protocolo.msg_login("alice"))
+        assert alice.receber()["tipo"] == "login_ok"
+        alice.enviar(protocolo.msg_mensagem_geral_enviar("mensagem so do servidor 1"))
+        time.sleep(0.1)
+        alice.fechar()
+
+        bob = ClienteDeTeste(50002)
+        bob.enviar(protocolo.msg_login("bob"))
+        assert bob.receber()["tipo"] == "login_ok"
+        bob.enviar(protocolo.msg_historico())
+        resposta = bob.receber()
+
+        assert resposta["mensagens"] == [], (
+            "vazamento de historico entre portas diferentes -- "
+            f"servidor 2 viu: {resposta['mensagens']}"
+        )
+        bob.fechar()
+    finally:
+        sock1.close()
+        sock2.close()
+        historico1.fechar()
+        historico2.fechar()
+
+
+def test_mesma_porta_reiniciando_continua_compartilhando_historico(tmp_path, monkeypatch):
+    """
+    Contraprova do teste acima: o isolamento é por PORTA, não por
+    execução — reiniciar o servidor na MESMA porta (sem --banco) precisa
+    continuar enxergando o histórico de antes. Esse é o comportamento
+    que já funcionava certinho e não pode regredir.
+    """
+    monkeypatch.chdir(tmp_path)
+    porta = 50003
+
+    registro1 = RegistroClientes()
+    historico1 = Historico(servidor._resolver_caminho_banco(None, porta))
+    sock1 = servidor.criar_socket_servidor("127.0.0.1", porta)
+    thread1 = threading.Thread(target=servidor.loop_accept, args=(sock1, registro1, historico1), daemon=True)
+    thread1.start()
+
+    alice = ClienteDeTeste(porta)
+    alice.enviar(protocolo.msg_login("alice"))
+    assert alice.receber()["tipo"] == "login_ok"
+    alice.enviar(protocolo.msg_mensagem_geral_enviar("mensagem antes de reiniciar"))
+    time.sleep(0.1)
+    alice.fechar()
+    sock1.close()
+    historico1.fechar()
+    thread1.join(timeout=servidor.TIMEOUT_ACCEPT_SEGUNDOS + 2)  # garante que a porta foi liberada de verdade
+
+    # "reinicia" o servidor na MESMA porta, sem --banco
+    registro2 = RegistroClientes()
+    historico2 = Historico(servidor._resolver_caminho_banco(None, porta))
+    sock2 = servidor.criar_socket_servidor("127.0.0.1", porta)
+    thread2 = threading.Thread(target=servidor.loop_accept, args=(sock2, registro2, historico2), daemon=True)
+    thread2.start()
+
+    try:
+        bob = ClienteDeTeste(porta)
+        bob.enviar(protocolo.msg_login("bob"))
+        assert bob.receber()["tipo"] == "login_ok"
+        bob.enviar(protocolo.msg_historico())
+        resposta = bob.receber()
+
+        assert [m["texto"] for m in resposta["mensagens"]] == ["mensagem antes de reiniciar"]
+        bob.fechar()
+    finally:
+        sock2.close()
+        historico2.fechar()
+
+
 def test_main_porta_ja_em_uso_mostra_erro_amigavel_sem_traceback(monkeypatch, capsys):
     """
     Regressão de UX: antes deste teste, uma porta já em uso (ex: dois

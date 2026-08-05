@@ -772,7 +772,6 @@ def main() -> None:
     args = parser.parse_args()
 
     registro = RegistroClientes()
-    historico = Historico(args.banco)
     usuarios = Usuarios(args.banco_usuarios)
 
     try:
@@ -788,7 +787,7 @@ def main() -> None:
         # endereço de soquete...") não ajuda o usuário e só polui a tela
         # — a dica logo abaixo já diz o que fazer.
         print(f"{_c('[erro]', _Cor.VERMELHO)} não foi possível iniciar o servidor na porta {args.porta} — já está em uso.")
-        print(f"{_c('[dica]', _Cor.CINZA)} tente outra porta (--porta) ou encerre o processo que já está usando essa.")        
+        print(f"{_c('[dica]', _Cor.CINZA)} tente outra porta (--porta) ou encerre o processo que já está usando essa.")
         usuarios.fechar()
         sys.exit(1)
 

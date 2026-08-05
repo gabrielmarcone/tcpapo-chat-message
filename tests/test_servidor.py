@@ -264,8 +264,193 @@ def test_login_duplicado_sem_distincao_de_maiusculas_minusculas(servidor_rodando
 
 
 # --------------------------------------------------------------------------
-# Mensagem geral / broadcast
+# Autenticação por senha
 # --------------------------------------------------------------------------
+
+def test_primeiro_login_cria_cadastro_e_loga(servidor_rodando):
+    """Não há etapa separada de 'criar conta' — o primeiro login com um
+    nome nunca visto já cadastra e autentica na mesma tacada."""
+    porta, _registro = servidor_rodando
+    c = ClienteDeTeste(porta)
+    c.enviar(protocolo.msg_login("alice", "minhasenha"))
+    assert c.receber() == {"tipo": "login_ok", "nome": "alice"}
+    c.fechar()
+
+
+def test_segundo_login_com_senha_correta_loga(servidor_rodando):
+    porta, _registro = servidor_rodando
+    # observador só serve pra ter um jeito determinístico de saber que o
+    # servidor JÁ terminou de processar a saída de c1 (recebendo a
+    # notificação "saiu do chat") antes de tentar logar de novo com o
+    # mesmo nome — sem isso, é uma corrida real: fechar o socket do
+    # cliente não garante que a THREAD do servidor já rodou
+    # registro.remover() no finally dela (bug de teste real encontrado
+    # ao escrever este mesmo teste da primeira vez).
+    observador = ClienteDeTeste(porta)
+    observador.enviar(protocolo.msg_login("observador", "senha123"))
+    assert observador.receber()["tipo"] == "login_ok"
+
+    c1 = ClienteDeTeste(porta)
+    c1.enviar(protocolo.msg_login("alice", "minhasenha"))
+    assert c1.receber()["tipo"] == "login_ok"
+    assert observador.receber()["tipo"] == "notificacao"  # "alice entrou no chat"
+
+    c1.enviar(protocolo.msg_sair())
+    c1.fechar()
+    assert observador.receber() == {"tipo": "notificacao", "texto": "alice saiu do chat"}
+
+    c2 = ClienteDeTeste(porta)
+    c2.enviar(protocolo.msg_login("alice", "minhasenha"))
+    assert c2.receber()["tipo"] == "login_ok"
+    c2.fechar()
+    observador.fechar()
+
+
+def test_login_com_senha_errada_e_rejeitado(servidor_rodando):
+    porta, _registro = servidor_rodando
+    observador = ClienteDeTeste(porta)
+    observador.enviar(protocolo.msg_login("observador", "senha123"))
+    assert observador.receber()["tipo"] == "login_ok"
+
+    c1 = ClienteDeTeste(porta)
+    c1.enviar(protocolo.msg_login("alice", "minhasenha"))
+    assert c1.receber()["tipo"] == "login_ok"
+    assert observador.receber()["tipo"] == "notificacao"
+
+    c1.enviar(protocolo.msg_sair())
+    c1.fechar()
+    assert observador.receber() == {"tipo": "notificacao", "texto": "alice saiu do chat"}
+
+    c2 = ClienteDeTeste(porta)
+    c2.enviar(protocolo.msg_login("alice", "senha_errada"))
+    resposta = c2.receber()
+    assert resposta["tipo"] == "login_erro"
+    assert resposta["motivo"] == "senha incorreta"
+
+    # retry automático continua funcionando com o mecanismo já existente
+    # (mesmo padrão de "nome ja em uso": login_erro -> cliente tenta de novo)
+    c2.enviar(protocolo.msg_login("alice", "minhasenha"))
+    assert c2.receber()["tipo"] == "login_ok"
+    c2.fechar()
+    observador.fechar()
+
+
+def test_nome_ja_online_prevalece_sobre_checagem_de_senha(servidor_rodando):
+    """
+    alice já está conectada; uma segunda tentativa com o MESMO nome, MESMA
+    senha (correta!), ainda assim recebe 'nome ja em uso' — a checagem de
+    "já está online agora" acontece ANTES da checagem de senha, então nem
+    chega a confirmar/negar se a senha bateria.
+    """
+    porta, _registro = servidor_rodando
+    c1 = ClienteDeTeste(porta)
+    c1.enviar(protocolo.msg_login("alice", "minhasenha"))
+    assert c1.receber()["tipo"] == "login_ok"
+
+    c2 = ClienteDeTeste(porta)
+    c2.enviar(protocolo.msg_login("alice", "minhasenha"))  # senha CORRETA, mas already online
+    resposta = c2.receber()
+    assert resposta["tipo"] == "login_erro"
+    assert resposta["motivo"] == "nome ja em uso"
+
+    c1.fechar()
+    c2.fechar()
+
+
+class _RegistroFalsoQueSempreRecusaAdicionar:
+    """
+    Simula o caso puramente defensivo em _processar_login: buscar()
+    confirma que ninguém está online com este nome (passa pelo passo 1),
+    mas adicionar() mesmo assim falha — algo que, dado o _lock_anuncio
+    cobrindo os dois passos atomicamente, "não deveria acontecer" na
+    prática. Cobre esse ramo defensivo sem precisar forçar uma corrida
+    real (que seria não-determinística).
+    """
+
+    def buscar(self, _nome):
+        return None
+
+    def adicionar(self, _cliente):
+        return False
+
+
+def test_login_com_falha_defensiva_ao_adicionar_apos_passo_1_responde_nome_em_uso():
+    usuarios = Usuarios(":memory:")
+    registro_falso = _RegistroFalsoQueSempreRecusaAdicionar()
+    login_bytes = protocolo.serializar(protocolo.msg_login("alice", "minhasenha"))
+    sock_falso = _SocketFalsoQueBraNoClose([login_bytes])
+
+    cliente, _buffer = servidor._processar_login(sock_falso, ("127.0.0.1", 0), registro_falso, usuarios, b"")
+
+    assert cliente is None  # login nunca completou (a "conexao" fica esperando novo recv, que retorna vazio)
+    usuarios.fechar()
+
+
+def test_login_sem_campo_senha_e_rejeitado(servidor_rodando):
+    porta, registro = servidor_rodando
+    c = ClienteDeTeste(porta)
+    c.enviar({"tipo": protocolo.TIPO_LOGIN, "nome": "alice"})  # sem 'senha'
+    resposta = c.receber()
+    assert resposta["tipo"] == "login_erro"
+    assert registro.buscar("alice") is None
+
+    # conexão continua viva — tenta de novo com senha de verdade
+    c.enviar(protocolo.msg_login("alice", "minhasenha"))
+    assert c.receber()["tipo"] == "login_ok"
+    c.fechar()
+
+
+def test_login_com_senha_vazia_e_rejeitado(servidor_rodando):
+    porta, _registro = servidor_rodando
+    c = ClienteDeTeste(porta)
+    c.enviar({"tipo": protocolo.TIPO_LOGIN, "nome": "alice", "senha": ""})
+    resposta = c.receber()
+    assert resposta["tipo"] == "login_erro"
+
+    c.enviar(protocolo.msg_login("alice", "minhasenha"))
+    assert c.receber()["tipo"] == "login_ok"
+    c.fechar()
+
+
+def test_login_com_senha_de_tipo_errado_e_rejeitado(servidor_rodando):
+    porta, _registro = servidor_rodando
+    c = ClienteDeTeste(porta)
+    c.enviar({"tipo": protocolo.TIPO_LOGIN, "nome": "alice", "senha": 12345})
+    resposta = c.receber()
+    assert resposta["tipo"] == "login_erro"
+    c.fechar()
+
+
+def test_senha_e_especifica_por_nome_sem_distincao_de_maiusculas_minusculas(servidor_rodando):
+    """
+    Já que o nome é comparado sem distinção de maiúsculas/minúsculas em
+    todo o resto do sistema (RegistroClientes), a conta de usuário
+    também deve ser a MESMA para 'Alice' e 'alice' — logar com um case
+    diferente do usado no cadastro, mas com a senha certa, funciona
+    normalmente (depois de liberar o nome do registro de online).
+    """
+    porta, _registro = servidor_rodando
+    observador = ClienteDeTeste(porta)
+    observador.enviar(protocolo.msg_login("observador", "senha123"))
+    assert observador.receber()["tipo"] == "login_ok"
+
+    c1 = ClienteDeTeste(porta)
+    c1.enviar(protocolo.msg_login("Alice", "minhasenha"))  # cadastra como "Alice"
+    assert c1.receber()["tipo"] == "login_ok"
+    assert observador.receber()["tipo"] == "notificacao"
+
+    c1.enviar(protocolo.msg_sair())
+    c1.fechar()
+    assert observador.receber() == {"tipo": "notificacao", "texto": "Alice saiu do chat"}
+
+    c2 = ClienteDeTeste(porta)
+    c2.enviar(protocolo.msg_login("ALICE", "minhasenha"))  # mesmo usuario, case diferente, senha certa
+    assert c2.receber()["tipo"] == "login_ok"
+    c2.fechar()
+    observador.fechar()
+
+
+
 
 def test_broadcast_chega_aos_outros_da_sala(servidor_rodando):
     porta, _registro = servidor_rodando
@@ -1367,11 +1552,11 @@ def test_main_sem_banco_explicito_usa_arquivo_isolado_pela_porta_real(monkeypatc
     """
     monkeypatch.chdir(tmp_path)
 
-    def loop_accept_fake(_sock_servidor, _registro, _historico):
+    def loop_accept_fake(_sock_servidor, _registro, _historico, _usuarios):
         pass  # não precisa aceitar conexão nenhuma pra este teste
 
     monkeypatch.setattr(servidor, "loop_accept", loop_accept_fake)
-    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "0"])  # sem --banco de propósito
+    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "0", "--banco-usuarios", ":memory:"])  # sem --banco de propósito
 
     servidor.main()
 
@@ -1396,26 +1581,28 @@ def test_dois_servidores_em_portas_diferentes_sem_banco_nao_compartilham_histori
 
     registro1 = RegistroClientes()
     historico1 = Historico(servidor._resolver_caminho_banco(None, 50001))
+    usuarios1 = Usuarios(":memory:")
     sock1 = servidor.criar_socket_servidor("127.0.0.1", 50001)
-    thread1 = threading.Thread(target=servidor.loop_accept, args=(sock1, registro1, historico1), daemon=True)
+    thread1 = threading.Thread(target=servidor.loop_accept, args=(sock1, registro1, historico1, usuarios1), daemon=True)
     thread1.start()
 
     registro2 = RegistroClientes()
     historico2 = Historico(servidor._resolver_caminho_banco(None, 50002))
+    usuarios2 = Usuarios(":memory:")
     sock2 = servidor.criar_socket_servidor("127.0.0.1", 50002)
-    thread2 = threading.Thread(target=servidor.loop_accept, args=(sock2, registro2, historico2), daemon=True)
+    thread2 = threading.Thread(target=servidor.loop_accept, args=(sock2, registro2, historico2, usuarios2), daemon=True)
     thread2.start()
 
     try:
         alice = ClienteDeTeste(50001)
-        alice.enviar(protocolo.msg_login("alice"))
+        alice.enviar(protocolo.msg_login("alice", "senha123"))
         assert alice.receber()["tipo"] == "login_ok"
         alice.enviar(protocolo.msg_mensagem_geral_enviar("mensagem so do servidor 1"))
         time.sleep(0.1)
         alice.fechar()
 
         bob = ClienteDeTeste(50002)
-        bob.enviar(protocolo.msg_login("bob"))
+        bob.enviar(protocolo.msg_login("bob", "senha123"))
         assert bob.receber()["tipo"] == "login_ok"
         bob.enviar(protocolo.msg_historico())
         resposta = bob.receber()
@@ -1430,6 +1617,8 @@ def test_dois_servidores_em_portas_diferentes_sem_banco_nao_compartilham_histori
         sock2.close()
         historico1.fechar()
         historico2.fechar()
+        usuarios1.fechar()
+        usuarios2.fechar()
 
 
 def test_mesma_porta_reiniciando_continua_compartilhando_historico(tmp_path, monkeypatch):
@@ -1444,30 +1633,33 @@ def test_mesma_porta_reiniciando_continua_compartilhando_historico(tmp_path, mon
 
     registro1 = RegistroClientes()
     historico1 = Historico(servidor._resolver_caminho_banco(None, porta))
+    usuarios1 = Usuarios(":memory:")
     sock1 = servidor.criar_socket_servidor("127.0.0.1", porta)
-    thread1 = threading.Thread(target=servidor.loop_accept, args=(sock1, registro1, historico1), daemon=True)
+    thread1 = threading.Thread(target=servidor.loop_accept, args=(sock1, registro1, historico1, usuarios1), daemon=True)
     thread1.start()
 
     alice = ClienteDeTeste(porta)
-    alice.enviar(protocolo.msg_login("alice"))
+    alice.enviar(protocolo.msg_login("alice", "senha123"))
     assert alice.receber()["tipo"] == "login_ok"
     alice.enviar(protocolo.msg_mensagem_geral_enviar("mensagem antes de reiniciar"))
     time.sleep(0.1)
     alice.fechar()
     sock1.close()
     historico1.fechar()
+    usuarios1.fechar()
     thread1.join(timeout=servidor.TIMEOUT_ACCEPT_SEGUNDOS + 2)  # garante que a porta foi liberada de verdade
 
     # "reinicia" o servidor na MESMA porta, sem --banco
     registro2 = RegistroClientes()
     historico2 = Historico(servidor._resolver_caminho_banco(None, porta))
+    usuarios2 = Usuarios(":memory:")
     sock2 = servidor.criar_socket_servidor("127.0.0.1", porta)
-    thread2 = threading.Thread(target=servidor.loop_accept, args=(sock2, registro2, historico2), daemon=True)
+    thread2 = threading.Thread(target=servidor.loop_accept, args=(sock2, registro2, historico2, usuarios2), daemon=True)
     thread2.start()
 
     try:
         bob = ClienteDeTeste(porta)
-        bob.enviar(protocolo.msg_login("bob"))
+        bob.enviar(protocolo.msg_login("bob", "senha123"))
         assert bob.receber()["tipo"] == "login_ok"
         bob.enviar(protocolo.msg_historico())
         resposta = bob.receber()
@@ -1477,6 +1669,7 @@ def test_mesma_porta_reiniciando_continua_compartilhando_historico(tmp_path, mon
     finally:
         sock2.close()
         historico2.fechar()
+        usuarios2.fechar()
 
 
 def test_main_porta_ja_em_uso_mostra_erro_amigavel_sem_traceback(monkeypatch, capsys):
@@ -1491,7 +1684,10 @@ def test_main_porta_ja_em_uso_mostra_erro_amigavel_sem_traceback(monkeypatch, ca
         raise OSError("[Errno 98] Address already in use")
 
     monkeypatch.setattr(servidor, "criar_socket_servidor", criar_socket_servidor_fake)
-    monkeypatch.setattr("sys.argv", ["servidor.py", "--porta", "5000", "--banco", ":memory:"])
+    monkeypatch.setattr(
+        "sys.argv",
+        ["servidor.py", "--porta", "5000", "--banco", ":memory:", "--banco-usuarios", ":memory:"],
+    )
 
     with pytest.raises(SystemExit) as exc_info:
         servidor.main()
@@ -1503,11 +1699,11 @@ def test_main_porta_ja_em_uso_mostra_erro_amigavel_sem_traceback(monkeypatch, ca
 
 
 def test_main_trata_keyboardinterrupt_sem_propagar(monkeypatch, capsys):
-    def loop_accept_fake(_sock_servidor, _registro, _historico):
+    def loop_accept_fake(_sock_servidor, _registro, _historico, _usuarios):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(servidor, "loop_accept", loop_accept_fake)
-    monkeypatch.setattr("sys.argv", ["servidor.py", "--banco", ":memory:"])
+    monkeypatch.setattr("sys.argv", ["servidor.py", "--banco", ":memory:", "--banco-usuarios", ":memory:"])
 
     servidor.main()  # não deve propagar a exceção
 

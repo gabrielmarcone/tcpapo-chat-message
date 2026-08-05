@@ -265,6 +265,19 @@ class TestParseComandoLimpar(unittest.TestCase):
                 cliente_app.parse_comando("/limpar")
         self.assertIn("\033[2J", saida.getvalue())
 
+    def test_limpar_tambem_limpa_o_buffer_de_rolagem(self):
+        """
+        \\033[2J sozinho só limpa a área visível -- o conteúdo antigo
+        continua existindo no buffer de rolagem (scrollback) e reaparece
+        se o usuário rolar a tela pra cima. \\033[3J é a parte que limpa
+        o scrollback de verdade; sem ela, /limpar só "empurra" o
+        conteúdo antigo para fora da vista, sem apagar nada de fato.
+        """
+        with patch.object(cliente_app, "_USAR_COR", True):
+            with contextlib.redirect_stdout(io.StringIO()) as saida:
+                cliente_app.parse_comando("/limpar")
+        self.assertIn("\033[3J", saida.getvalue())
+
     def test_limpar_nao_envia_sequencia_ansi_quando_nao_e_terminal(self):
         """Saída redirecionada/capturada por teste não deve receber bytes
         de controle -- eles não fariam sentido nesse contexto."""

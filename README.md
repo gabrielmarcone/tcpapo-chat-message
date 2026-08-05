@@ -4,7 +4,7 @@
 
 [![Python Version](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Dependências](https://img.shields.io/badge/depend%C3%AAncias%20em%20produ%C3%A7%C3%A3o-nenhuma-brightgreen.svg)](#-tecnologias)
-[![Testes](https://img.shields.io/badge/testes-213%20passing-success.svg)](#-testes)
+[![Testes](https://img.shields.io/badge/testes-226%20passing-success.svg)](#-testes)
 [![Status](https://img.shields.io/badge/status-completo-success.svg)](#-funcionalidades)
 
 ---
@@ -76,6 +76,7 @@ mesmo socket.
 - [x] Mensagens de sistema com símbolo padronizado (✓ sucesso, ✗ erro, ⚠ aviso)
 - [x] Sua própria mensagem enviada aparece destacada, diferente das dos outros
 - [x] Timestamps em todas as mensagens
+- [x] Comando `/limpar` para limpar a tela sem perder o histórico salvo no servidor
 
 ### 🐣 Easter eggs
 - **`/cafe`** — porque toda madrugada de código precisa de uma pausa
@@ -181,6 +182,8 @@ novo já cadastra a senha; nos seguintes, a mesma senha é exigida.
 | `/entrar <sala>` | Entra numa sala (criada se não existir) | `/entrar jogos` |
 | `/sair_sala` | Volta para a sala `"geral"` | `/sair_sala` |
 | `/historico [quantidade]` | Mensagens recentes da sala atual (padrão 20, máx. 100) | `/historico 5` |
+| `/ajuda` | Mostra a lista de comandos novamente | `/ajuda` |
+| `/limpar` | Limpa a tela (o histórico salvo no servidor não é afetado) | `/limpar` |
 | `/sair` | Encerra a conexão | `/sair` |
 | `Ctrl+C` | Encerra a conexão a qualquer momento | — |
 
@@ -195,7 +198,7 @@ de maiúsculas/minúsculas.
 python -m pytest tests/ -v
 ```
 
-213 testes, cobrindo desde os módulos isolados até testes de
+226 testes, cobrindo desde os módulos isolados até testes de
 integração que sobem um servidor real e conectam clientes de teste de
 verdade nele — login, broadcast, salas, privadas, histórico e
 concorrência, tudo de ponta a ponta.

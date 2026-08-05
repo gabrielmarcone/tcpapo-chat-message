@@ -1,16 +1,12 @@
 """
 tests/test_protocolo.py — Testes do módulo protocolo.py
 
-Dono: CONJUNTO (Dev A e Dev B, mantido pelos dois).
-
 Este é o teste mais importante do projeto: valida o framing por
 delimitador de linha e a validação de forma da mensagem, que são a base
-de tudo o resto (servidor, cliente, stubs). Deve passar 100% antes de
-servidor.py e cliente_app.py avançarem além do esqueleto.
+de tudo o resto (servidor, cliente, stubs).
 
-Inclui os casos descobertos ao comparar as duas implementações
-independentes (Dev A e Dev B) antes da fusão: mensagem sem campo 'tipo' e
-JSON que não é um objeto agora são rejeitados com ErroProtocolo, em vez de
+Inclui casos de robustez importantes: mensagem sem campo 'tipo' e JSON
+que não é um objeto são rejeitados com ErroProtocolo, em vez de
 passarem adiante silenciosamente.
 """
 
@@ -132,11 +128,10 @@ def test_extrair_tolera_crlf():
 
 def test_texto_com_quebra_de_linha_nao_quebra_framing():
     """
-    Substitui a etapa de "sanitização manual de \n" do plano original: se
-    o texto do usuário contém uma quebra de linha real e o framing
-    continua correto, sanitização adicional é desnecessária — porque
-    json.dumps já escapa o \n como os caracteres \\ e n dentro da string,
-    não como um byte de quebra real.
+    Confirma que uma quebra de linha real dentro do texto do usuário não
+    quebra o framing: json.dumps já escapa o \n como os caracteres \\ e n
+    dentro da string, não como um byte de quebra real, então nenhuma
+    sanitização adicional é necessária.
     """
     texto_multilinha = "linha 1\nlinha 2\nlinha 3"
     linha = protocolo.serializar(protocolo.msg_mensagem_geral_enviar(texto_multilinha))

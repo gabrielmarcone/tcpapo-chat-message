@@ -1,31 +1,19 @@
 """
 cliente_app.py — Cliente de chat (tcpapo-chat-message)
 
-Dono: Desenvolvedor B (ver Plano de Divisão de Trabalho, seção 9).
-NÃO editado por outra pessoa sem revisão via Pull Request.
-
-Escopo implementado neste arquivo (etapas 1 a 5 da tabela da seção 9):
-
-    Etapa 1 — Leitura de IP/porta via linha de comando (IP obrigatório,
-              sem valor padrão; porta com valor padrão) + conexão TCP,
-              com tratamento organizado de erro de conexão.
-    Etapa 2 — Login: envia 'login', trata 'login_ok'/'login_erro',
-              permitindo nova tentativa de nome em caso de erro.
-    Etapa 3 — Concorrência: thread dedicada exclusivamente à recepção
-              (recv + desserializa + imprime); a thread principal só lê
-              input() e envia.
-    Etapa 4 — Parsing de comandos digitados pelo usuário (texto comum,
-              /priv, /lista, /entrar, /sair_sala, /sair), isolado em
-              parse_comando() para não espalhar ifs pelo main().
-    Etapa 5 — Robustez: tratamento de todos os cenários de erro de rede
-              e de entrada (IP/porta inválidos, servidor indisponível,
-              timeout, conexão derrubada em qualquer momento da sessão,
-              Ctrl+C) sem tracebacks e com encerramento limpo dos
-              recursos (socket, thread). Ver notas de cada função abaixo
-              para o que foi acrescentado e por quê.
-
-NÃO implementado ainda (fica para a próxima etapa do Dev B):
-    - tests/test_cliente.py (etapa 6) — entregue como arquivo separado.
+Responsabilidade:
+    - Ler IP/porta via linha de comando e conectar ao servidor por TCP.
+    - Login: envia 'login', trata 'login_ok'/'login_erro', permitindo
+      nova tentativa de nome/senha em caso de erro.
+    - Concorrência: thread dedicada exclusivamente à recepção (recv +
+      desserializa + imprime); a thread principal só lê input() e envia.
+    - Parsing de comandos digitados pelo usuário (texto comum, /priv,
+      /lista, /entrar, /sair_sala, /historico, /sair), isolado em
+      parse_comando() para não espalhar ifs pelo main().
+    - Tratamento de todos os cenários de erro de rede e de entrada
+      (IP/porta inválidos, servidor indisponível, timeout, conexão
+      derrubada em qualquer momento da sessão, Ctrl+C) sem tracebacks e
+      com encerramento limpo dos recursos (socket, thread).
 
 Todo texto digitado que não seja um comando reconhecido (não começa com
 "/", ou é um "/" desconhecido/malformado) é tratado como mensagem geral
@@ -45,12 +33,10 @@ import protocolo
 
 
 # --------------------------------------------------------------------------
-# Saída no terminal — só cosmético (a pedido, para deixar as mensagens mais
-# legíveis: cores por tipo + horário). NÃO afeta protocolo nem lógica de
-# rede, e não é verificado por nenhum teste (test_cliente.py testa valores
-# de retorno, não texto impresso). Cores só aparecem quando a saída é um
-# terminal de verdade (sys.stdout.isatty()) — redirecionada para arquivo
-# ou capturada por teste, sai como texto puro.
+# Saída no terminal — cosmético: não afeta protocolo nem lógica de rede.
+# Cores só aparecem quando a saída é um terminal de verdade
+# (sys.stdout.isatty()); redirecionada para arquivo ou capturada por
+# teste, sai como texto puro.
 # --------------------------------------------------------------------------
 
 class _Cor:
@@ -66,11 +52,11 @@ class _Cor:
     ITALICO = "\033[3m"
     SUBLINHADO = "\033[4m"
 
-    # Paleta reservada só pra identidade de usuário (hash do nome -> cor),
-    # separada da paleta "semântica" acima (que já significa uma coisa
+    # Paleta reservada só para identidade de usuário (hash do nome -> cor),
+    # separada da paleta semântica acima (que já significa uma coisa
     # fixa: vermelho = erro, amarelo = aviso/notificação, verde = ok,
     # ciano = rótulo de lista/histórico). São as cores ANSI normais (não
-    # as "brilhantes" 90-97 usadas acima), pra nunca ficar visualmente
+    # as "brilhantes" 90-97 usadas acima), para nunca ficar visualmente
     # igual a nenhuma cor semântica, mesmo lado a lado.
     USUARIO = [
         "\033[31m",  # vermelho
@@ -82,7 +68,7 @@ class _Cor:
     ]
 
     # Cor fixa e reservada só para "você" — nunca sorteada pelo hash (ver
-    # _cor_do_usuario), pra sua própria mensagem ser sempre reconhecível
+    # _cor_do_usuario), para sua própria mensagem ser sempre reconhecível
     # de cara, em qualquer sala, mesmo se por coincidência ela combinasse
     # com a cor de outro usuário.
     VOCE = "\033[97m"  # branco brilhante
@@ -93,9 +79,8 @@ _USAR_COR = sys.stdout.isatty()
 if sys.platform == "win32" and _USAR_COR:
     # Em terminais Windows mais antigos (fora do Windows Terminal), o
     # processamento de sequências ANSI vem desligado por padrão.
-    # os.system("") é um truque conhecido e sem dependência externa que
-    # liga isso pro resto do processo — no Windows Terminal já vem
-    # ligado, então isso é só uma rede de segurança para outros terminais.
+    # os.system("") liga isso pro resto do processo, sem depender de
+    # nenhuma biblioteca externa.
     os.system("")
 
 
@@ -112,19 +97,19 @@ def _hora() -> str:
 
 def _cor_do_usuario(nome: str) -> str:
     """
-    Sempre a MESMA cor para o mesmo nome (estilo IRC/Discord antigo) —
+    Sempre a mesma cor para o mesmo nome (estilo IRC/Discord antigo) —
     faz uma sala cheia ficar muito mais fácil de acompanhar visualmente,
     porque cada pessoa "tem uma cor" consistente do início ao fim da
     conversa, em vez de tudo sair só em negrito branco.
 
     casefold() de propósito: mesma convenção usada no resto do sistema
-    (RegistroClientes, usuarios.py) — "Alice" e "alice" são a MESMA
-    pessoa, então têm que sair com a MESMA cor.
+    (RegistroClientes, usuarios.py) — "Alice" e "alice" são a mesma
+    pessoa, então têm que sair com a mesma cor.
 
     Soma dos códigos dos caracteres (não hash() nativo do Python): hash()
     de string muda a cada execução do processo por segurança
-    (PYTHONHASHSEED aleatório) — precisamos do oposto aqui, a cor tem que
-    ser estável entre sessões diferentes, não só dentro de uma.
+    (PYTHONHASHSEED aleatório), e a cor precisa ser estável entre
+    sessões diferentes, não só dentro de uma.
     """
     indice = sum(ord(caractere) for caractere in nome.casefold()) % len(_Cor.USUARIO)
     return _Cor.USUARIO[indice]
@@ -134,14 +119,13 @@ def _estilo_do_usuario(nome: str) -> str:
     """
     Estilo completo (cor + negrito, e às vezes + sublinhado) para o nome
     de um remetente. Com só 6 cores na paleta de identidade, uma sala
-    com mais de 6 pessoas ativas — ou até menos, por coincidência
-    (testado e confirmado: 3 nomes já bastaram pra dar colisão de cor)
-    — inevitavelmente repete cor entre duas pessoas diferentes.
-    Sublinhado como segunda dimensão dobra o espaço de combinações
-    distintas (6 cores × 2) sem sair de atributos ANSI básicos
-    (negrito=1, sublinhado=4) — os mais universalmente suportados, mais
-    seguro do que arriscar cores de 256 cores, que nem todo terminal
-    mais antigo entende direito.
+    com mais de 6 pessoas ativas — ou até menos, por coincidência —
+    inevitavelmente repete cor entre duas pessoas diferentes. Sublinhado
+    como segunda dimensão dobra o espaço de combinações distintas (6
+    cores × 2) sem sair de atributos ANSI básicos (negrito=1,
+    sublinhado=4), os mais universalmente suportados — mais seguro do
+    que arriscar cores de 256 cores, que nem todo terminal mais antigo
+    entende direito.
     """
     espaco_total = len(_Cor.USUARIO) * 2
     indice = sum(ord(caractere) for caractere in nome.casefold()) % espaco_total
@@ -172,19 +156,19 @@ def _info(texto: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# Constantes de robustez (etapa 5)
+# Constantes de robustez
 # --------------------------------------------------------------------------
 
-# Timeout aplicado SÓ durante a tentativa de connect() (etapa 1/5). Depois
-# de conectado, o socket volta ao modo bloqueante padrão (sock.settimeout
-# (None) em conectar()) porque o restante da sessão já depende de recv()
-# bloqueante rodando em thread própria (etapa 3) — não faria sentido (nem
-# foi pedido) um timeout de inatividade na conversa.
+# Timeout aplicado só durante a tentativa de connect(). Depois de
+# conectado, o socket volta ao modo bloqueante padrão (sock.settimeout
+# (None) em conectar()), já que o restante da sessão depende de recv()
+# bloqueante rodando em thread própria — não faria sentido um timeout de
+# inatividade na conversa.
 TIMEOUT_CONEXAO = 5.0  # segundos
 
 
 # --------------------------------------------------------------------------
-# Etapa 5 — validação de argumentos de linha de comando
+# Validação de argumentos de linha de comando
 # --------------------------------------------------------------------------
 # Usada como `type=` no argparse para --porta. Sem isso, uma porta como
 # "abc" já falha no argparse com uma mensagem razoável (sem traceback),
@@ -208,7 +192,7 @@ def validar_porta(valor: str) -> int:
 
 
 # --------------------------------------------------------------------------
-# Etapa 1 — conexão
+# Conexão
 # --------------------------------------------------------------------------
 
 def conectar(ip: str, porta: int) -> socket.socket:
@@ -217,18 +201,15 @@ def conectar(ip: str, porta: int) -> socket.socket:
 
     Trata os erros de conexão mais comuns de forma organizada, com
     mensagem amigável para o usuário, e encerra o programa se a conexão
-    não puder ser estabelecida (sem conexão, não há mais nada a fazer
-    nas próximas etapas).
+    não puder ser estabelecida (sem conexão, não há mais nada a fazer).
 
-    Etapa 5: acrescentado sock.settimeout(TIMEOUT_CONEXAO) antes do
-    connect() — sem um timeout explícito, socket.timeout nunca era de
-    fato levantado (o except já existia, mas era código morto), e uma
-    tentativa de conexão a um IP que existe na rede mas não responde
-    (ex: firewall descartando o pacote silenciosamente, em vez de
-    recusar a conexão) ficava travada indefinidamente em vez de falhar
-    com uma mensagem clara. Depois de conectar com sucesso, o timeout é
-    removido (settimeout(None)) para não afetar o recv() bloqueante
-    usado pelo resto da aplicação (etapa 3).
+    sock.settimeout(TIMEOUT_CONEXAO) é aplicado antes do connect(): sem
+    um timeout explícito, uma tentativa de conexão a um IP que existe na
+    rede mas não responde (ex: firewall descartando o pacote
+    silenciosamente, em vez de recusar a conexão) ficaria travada
+    indefinidamente em vez de falhar com uma mensagem clara. Depois de
+    conectar com sucesso, o timeout é removido (settimeout(None)) para
+    não afetar o recv() bloqueante usado pelo resto da aplicação.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(TIMEOUT_CONEXAO)
@@ -274,19 +255,18 @@ class EstadoCliente:
     envia comandos) e a thread de recepção (que exibe mensagens). Hoje
     guarda só a sala atual.
 
-    Necessário porque o protocolo NÃO inclui o nome da sala na mensagem
-    mensagem_geral (decisão da Especificação, seção 8.3: o servidor
-    decide o escopo do broadcast a partir do estado interno dele, sem
-    expor isso no dado da mensagem) — então, sem rastrear isso aqui, o
-    cliente não tinha como saber de qual sala veio uma mensagem geral
-    recebida, e sempre mostrava "[geral]" mesmo depois de /entrar em
-    outra sala (bug real observado em teste manual).
+    Necessário porque o protocolo não inclui o nome da sala na mensagem
+    mensagem_geral — o servidor decide o escopo do broadcast a partir do
+    estado interno dele, sem expor isso no dado da mensagem — então, sem
+    rastrear isso aqui, o cliente não teria como saber de qual sala veio
+    uma mensagem geral recebida, e sempre mostraria "[geral]" mesmo
+    depois de /entrar em outra sala.
 
-    Atualizado de forma OTIMISTA em main(), logo após enviar /entrar ou
+    Atualizado de forma otimista em main(), logo após enviar /entrar ou
     /sair_sala com sucesso — sem esperar confirmação do servidor. Isso é
     seguro porque o servidor sempre aceita esses comandos quando o campo
     já foi validado no cliente (a única exceção — pedir para entrar na
-    sala em que já está — ainda deixa o cliente na MESMA sala, então a
+    sala em que já está — ainda deixa o cliente na mesma sala, então a
     atualização otimista continua correta nesse caso também).
     """
 
@@ -312,8 +292,6 @@ def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
     elif tipo == protocolo.TIPO_ERRO:
         print(f"{hora} {_c('✗ [erro do servidor]', _Cor.VERMELHO)} {msg.get('motivo', '')}")
     elif tipo == protocolo.TIPO_LISTA_USUARIOS:
-        # Adicionado na etapa 4: sem isso, a resposta de /lista caía no
-        # "else" genérico abaixo e mostrava o dict cru na tela.
         usuarios = msg.get("usuarios", [])
         print(f"{hora} {_c('[lista]', _Cor.CIANO)} usuários conectados:")
         if not usuarios:
@@ -341,22 +319,22 @@ def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
                 remetente_item = _c_nome(item.get("remetente", "?"))
                 print(f"    {hora_item} {remetente_item}: {item.get('texto', '')}")
     else:
-        # Tipo não tratado ainda (não deveria acontecer, dado o contrato
-        # fechado de protocolo.py). Não inventamos formatação para campos
-        # que não conhecemos — só exibimos bruto.
+        # Tipo não tratado (não deveria acontecer, dado o contrato
+        # fechado de protocolo.py). Não inventamos formatação para
+        # campos que não conhecemos — só exibimos bruto.
         print(f"{hora} [{tipo}] {msg}")
 
 
 def _imprimir_minha_mensagem_geral(estado: EstadoCliente, texto: str) -> None:
     """
-    Confirmação formatada da PRÓPRIA mensagem geral, logo após enviar —
-    o servidor nunca ecoa de volta a mensagem pra quem mandou (ver seção
-    5 do protocolo), então sem isso a única coisa na tela seria o eco
-    cru do terminal (o que você literalmente digitou), sem hora, sala
-    ou nenhuma formatação — bem diferente de como as mensagens dos
-    outros aparecem. "você" usa sempre a MESMA cor reservada (_Cor.VOCE),
-    nunca a cor "sorteada" por hash — assim sua própria fala é
-    reconhecível de cara, mesmo numa sala cheia de gente colorida.
+    Confirmação formatada da própria mensagem geral, logo após enviar —
+    o servidor nunca ecoa a mensagem de volta para quem mandou, então
+    sem isso a única coisa na tela seria o eco cru do terminal (o que
+    foi digitado), sem hora, sala ou nenhuma formatação — bem diferente
+    de como as mensagens dos outros aparecem. "você" usa sempre a mesma
+    cor reservada (_Cor.VOCE), nunca a cor sorteada por hash — assim a
+    própria fala é reconhecível de cara, mesmo numa sala cheia de gente
+    colorida.
     """
     hora = _c(f"[{_hora()}]", _Cor.CINZA)
     sala = _c(f"[{estado.sala_atual}]", _Cor.AZUL)
@@ -373,31 +351,28 @@ def _imprimir_minha_mensagem_privada(destinatario: str, texto: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# Etapa 2 — login
+# Login
 # --------------------------------------------------------------------------
 
 def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
     """
-    Pede um apelido ao usuário, envia 'login' (via protocolo.msg_login) e
-    espera a resposta do servidor.
+    Pede um apelido e senha ao usuário, envia 'login' (via
+    protocolo.msg_login) e espera a resposta do servidor.
 
     - Se vier login_ok: retorna (nome_confirmado, buffer_restante).
       buffer_restante contém quaisquer bytes já recebidos além da
       resposta de login (ex: se o servidor emendou uma notificação no
       mesmo pacote) — repassado para thread_recepcao() não perder nada.
-    - Se vier login_erro: mostra o motivo e pede outro apelido,
+    - Se vier login_erro: mostra o motivo e pede outro apelido/senha,
       reenviando a mensagem (laço externo).
 
-    Não modifica protocolo.py; usa só as funções já prontas de lá.
-
-    Etapa 5: acrescentados excepts explícitos para BrokenPipeError e
-    ConnectionResetError (antes de OSError) tanto no envio quanto na
-    espera da resposta — tecnicamente já caíam no `except OSError`
-    genérico (são subclasses), mas com mensagem menos clara para o
-    usuário sobre o que de fato aconteceu (conexão caiu, não é um erro
-    de rede qualquer). Também acrescentado KeyboardInterrupt: antes,
-    Ctrl+C durante o login (digitando o apelido ou esperando resposta)
-    subia como traceback cru até o topo do programa.
+    BrokenPipeError e ConnectionResetError são tratados antes do
+    `except OSError` genérico (são subclasses), para dar uma mensagem
+    mais clara ao usuário sobre o que aconteceu (conexão caiu, não é um
+    erro de rede qualquer). KeyboardInterrupt também é tratado
+    explicitamente, para que Ctrl+C durante o login (digitando o
+    apelido ou esperando resposta) encerre de forma limpa em vez de
+    subir como traceback.
     """
     buffer = b""
 
@@ -408,7 +383,7 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
                 _aviso("o apelido não pode ser vazio.")
                 continue
 
-            # NOVO — pede a senha. getpass() não ecoa o que é digitado.
+            # getpass() não ecoa o que é digitado.
             senha = getpass("Senha: ")
             if not senha:
                 _aviso("a senha não pode ser vazia.")
@@ -454,12 +429,13 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
                     if msg["tipo"] in (protocolo.TIPO_LOGIN_OK, protocolo.TIPO_LOGIN_ERRO):
                         resposta = msg
                         break
-                    # Mensagem que não é resposta de login (situação incomum,
-                    # mas o framing permite): só exibimos e seguimos esperando.
-                    # EstadoCliente() novo aqui (não o de main()) é
-                    # correto de propósito: antes do login terminar, o
-                    # cliente nunca teve chance de mudar de sala, então
-                    # "geral" (o padrão) é sempre a resposta certa.
+                    # Mensagem que não é resposta de login (situação
+                    # incomum, mas o framing permite): só exibimos e
+                    # seguimos esperando. EstadoCliente() novo aqui (não
+                    # o de main()) é correto de propósito: antes do
+                    # login terminar, o cliente nunca teve chance de
+                    # mudar de sala, então "geral" é sempre a resposta
+                    # certa.
                     imprimir_mensagem(msg, EstadoCliente())
 
             if resposta["tipo"] == protocolo.TIPO_LOGIN_OK:
@@ -478,19 +454,19 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
 
 
 # --------------------------------------------------------------------------
-# Etapa 3 — thread de recepção
+# Thread de recepção
 # --------------------------------------------------------------------------
 
 def _encerrar_conexao_forcado(sock: socket.socket, mensagem: str) -> None:
     """
-    Usado pela thread de recepção (etapa 5) quando a conexão cai por um
-    motivo que não foi a thread principal pedindo para encerrar (ex:
-    servidor caiu, cabo de rede foi desconectado). Nesse momento a
-    thread principal muito provavelmente está bloqueada em input(),
-    esperando o usuário digitar algo — e input() é uma chamada
-    bloqueante que não escuta eventos (threading.Event) nem sockets, só
-    o teclado. Não existe forma portátil e simples (sem depender de
-    bibliotecas extras) de "acordar" educadamente essa chamada.
+    Usado pela thread de recepção quando a conexão cai por um motivo que
+    não foi a thread principal pedindo para encerrar (ex: servidor caiu,
+    cabo de rede foi desconectado). Nesse momento a thread principal
+    muito provavelmente está bloqueada em input(), esperando o usuário
+    digitar algo — e input() é uma chamada bloqueante que não escuta
+    eventos (threading.Event) nem sockets, só o teclado. Não existe
+    forma portátil e simples (sem depender de bibliotecas extras) de
+    "acordar" educadamente essa chamada.
 
     Por isso, em vez de deixar o programa preso esperando o usuário
     apertar Enter para só então perceber que a conexão caiu, avisamos o
@@ -521,13 +497,12 @@ def thread_recepcao(
     Encerra quando evento_encerrando é sinalizado (pela thread principal,
     em encerrar()) ou quando a conexão cai por qualquer motivo.
 
-    Etapa 5: distinção importante entre dois casos de recv()/OSError
-    falhando:
-        1. evento_encerrando JÁ estava setado -> foi a thread principal
+    Distinção importante entre dois casos de recv()/OSError falhando:
+        1. evento_encerrando já estava setado -> foi a thread principal
            que fechou o socket de propósito (usuário digitou /sair ou
            Ctrl+C, via encerrar()). É o caminho normal de desligamento:
            não há erro real, só terminamos o loop em silêncio.
-        2. evento_encerrando NÃO estava setado -> a conexão caiu por
+        2. evento_encerrando não estava setado -> a conexão caiu por
            conta própria (servidor encerrou, cabo caiu, etc.) enquanto
            a sessão estava ativa. Aí sim é um erro de verdade, tratado
            por _encerrar_conexao_forcado() (ver docstring acima).
@@ -574,11 +549,10 @@ def enviar(sock: socket.socket, mensagem: dict) -> bool:
     """
     Serializa `mensagem` (via protocolo.serializar) e envia pelo socket.
     Retorna True se enviou com sucesso, False se houve falha (nesse caso
-    já imprime um erro amigável; quem chama decide o que fazer a
-    seguir — ver main(), que agora encerra a sessão quando enviar()
-    retorna False, etapa 5).
+    já imprime um erro amigável; quem chama decide o que fazer a seguir
+    — ver main(), que encerra a sessão quando enviar() retorna False).
 
-    Etapa 5: BrokenPipeError e ConnectionResetError tratados antes do
+    BrokenPipeError e ConnectionResetError são tratados antes do
     `except OSError` genérico, para dar ao usuário uma mensagem
     específica de "conexão perdida" em vez de "falha ao enviar
     mensagem" — a causa é diferente (rede caiu vs. outro erro de I/O) e
@@ -601,7 +575,7 @@ def enviar(sock: socket.socket, mensagem: dict) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Etapa 4 — parsing de comandos
+# Parsing de comandos
 # --------------------------------------------------------------------------
 # Todas as ações possíveis do que o usuário digita, decididas em um único
 # lugar (parse_comando) em vez de espalhadas como ifs pelo main().
@@ -617,7 +591,7 @@ COMANDO_ENTRAR = "/entrar"
 COMANDO_SAIR_SALA = "/sair_sala"
 COMANDO_SAIR = "/sair"
 COMANDO_HISTORICO = "/historico"
-COMANDO_CAFE = "/cafe"  # easter egg -- de propósito NÃO entra em TEXTO_AJUDA_COMANDOS
+COMANDO_CAFE = "/cafe"  # easter egg -- de propósito não entra em TEXTO_AJUDA_COMANDOS
 COMANDO_MINECRAFT = "/minecraft"  # idem
 COMANDO_BATMAN = "/batman"  # idem
 
@@ -643,11 +617,10 @@ _ARTE_CAFE = r"""
 def _mostrar_easter_egg_cafe() -> Tuple[str, None]:
     """
     Easter egg — /cafe, comando secreto (de propósito fora da lista de
-    ajuda). 100% local: não manda nada pro servidor, não precisa de
-    nenhuma mudança em protocolo.py nem servidor.py, então zero risco
-    pras funcionalidades de verdade — só um agrado na hora da
-    demonstração. Reaproveita ACAO_VAZIO (mesma "ação" de uma linha em
-    branco: nada a enviar, nada mais a fazer).
+    ajuda). 100% local: não manda nada pro servidor, não depende de
+    nenhuma mudança em protocolo.py nem servidor.py. Reaproveita
+    ACAO_VAZIO (mesma ação de uma linha em branco: nada a enviar, nada
+    mais a fazer).
     """
     print(_c(_ARTE_CAFE, _Cor.AMARELO))
     print(f"  {_c('☕ pausa pro café — volta já!', _Cor.AMARELO + _Cor.NEGRITO)}")
@@ -714,10 +687,8 @@ def parse_comando(texto: str) -> Tuple[str, Optional[dict]]:
                                  com uma função protocolo.msg_*, para
                                  enviar ao servidor.
         (ACAO_SAIR, None)     -> usuário digitou '/sair'; quem chama deve
-                                 encerrar a conexão (não há nada a enviar
-                                 ao servidor: o encerramento é local,
-                                 conforme decisão já tomada em
-                                 encerrar()/main() para esta etapa).
+                                 encerrar a conexão localmente (não há
+                                 nada a enviar ao servidor).
         (ACAO_INVALIDO, None) -> a linha começa com '/' mas não é um
                                  comando reconhecido, ou está mal
                                  formada (faltam argumentos obrigatórios,
@@ -728,8 +699,7 @@ def parse_comando(texto: str) -> Tuple[str, Optional[dict]]:
                                  nada a fazer.
 
     Texto comum (que não começa com '/') vira sempre mensagem geral, via
-    protocolo.msg_mensagem_geral_enviar() — igual ao comportamento das
-    etapas 1-3, sem mudança para quem só digita texto normal.
+    protocolo.msg_mensagem_geral_enviar().
     """
     texto = texto.strip()
 
@@ -799,11 +769,9 @@ def encerrar(sock: socket.socket, evento_encerrando: threading.Event) -> None:
     Fecha a conexão de forma organizada.
 
     O comando /sair (via parse_comando) apenas sinaliza para o main()
-    encerrar localmente — não enviamos protocolo.msg_sair() pela rede de
-    propósito nesta etapa, já que o servidor já trata desconexão abrupta
-    como caminho normal (ver plano, tarefa 11 do Dev A), então
-    simplesmente fechar o socket é suficiente e correto para o escopo
-    atual.
+    encerrar localmente — não enviamos protocolo.msg_sair() pela rede,
+    já que o servidor já trata desconexão abrupta como caminho normal,
+    então simplesmente fechar o socket é suficiente e correto.
     """
     evento_encerrando.set()
     try:
@@ -891,10 +859,6 @@ def main() -> None:
 
             # acao == ACAO_ENVIAR
             if not enviar(sock, mensagem):
-                # Etapa 5: antes, uma falha de enviar() era só impressa e
-                # o loop continuava tentando digitar/enviar normalmente,
-                # mesmo com a conexão já morta. Agora encerramos a sessão
-                # de forma limpa assim que um envio falha de verdade.
                 _info("encerrando devido a falha no envio.")
                 break
 

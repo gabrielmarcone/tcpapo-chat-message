@@ -1,12 +1,9 @@
 """
 tests/test_modelos.py — Testes de modelos.py (Cliente, RegistroClientes)
 
-Dono: DEV A.
-
-Separado de tests/test_servidor.py (que fica para quando servidor.py tiver
-o loop de accept/roteamento de fato implementado) porque estes testes só
-dependem de modelos.py — testá-los aqui, isoladamente, não exige nenhum
-socket real nem servidor.py existir.
+Separado de tests/test_servidor.py porque estes testes só dependem de
+modelos.py — testá-los aqui, isoladamente, não exige nenhum socket real
+nem servidor.py existir.
 
 O caso mais importante aqui é test_adicionar_mesmo_nome_sob_concorrencia:
 não basta adicionar() ser "logicamente" correto — precisa ser correto
@@ -70,10 +67,10 @@ def test_adicionar_nome_duplicado_retorna_false():
 
 def test_adicionar_nome_duplicado_sem_distincao_de_maiusculas_minusculas():
     """
-    Bug real observado: 'Alice' e 'alice' conseguiam se conectar ao
-    mesmo tempo como usuários "diferentes" — confuso pra quem tenta
-    mandar mensagem privada usando o case que lembra, e potencialmente
-    dois clientes pensando que são o único 'Alice' do chat.
+    'Alice' e 'alice' devem ser tratados como o mesmo usuário — sem
+    isso, os dois conseguiriam se conectar ao mesmo tempo como pessoas
+    "diferentes", o que é confuso para quem manda mensagem privada
+    usando o case que lembra.
     """
     registro = RegistroClientes()
     assert registro.adicionar(_cliente_fake("Alice")) is True

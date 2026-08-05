@@ -1,28 +1,21 @@
 """
-dev_tools/servidor_stub.py — Servidor simulado, para o Dev B testar o
+dev_tools/servidor_stub.py — Servidor simulado, para testar o
 cliente_app.py isoladamente, sem depender do servidor.py real.
 
-Dono: DEV B.
-
-Faz parte do repositório (não é descartável) — é evidência, para o
-relatório, de que o cliente foi testado de ponta a ponta antes da
-integração real com o servidor do Dev A.
-
-Regra importante (seção 6 do Plano de Divisão): este script usa
-protocolo.py de verdade (serializar / extrair_mensagens) para montar e
-interpretar mensagens — NUNCA constrói ou lê JSON manualmente. Isso
-garante que o framing real está sendo exercitado desde o primeiro teste
-isolado do cliente, não só na integração final com o servidor do Dev A.
+Usa protocolo.py de verdade (serializar / extrair_mensagens) para montar
+e interpretar mensagens — nunca constrói ou lê JSON manualmente. Isso
+garante que o framing real é exercitado desde o primeiro teste isolado
+do cliente, não só na integração final com o servidor de verdade.
 
 --------------------------------------------------------------------------
-Comportamento implementado (os 4 passos do TODO original):
+Comportamento:
 --------------------------------------------------------------------------
 1. Aceita uma única conexão, bind em 0.0.0.0 (para funcionar também se
    testado a partir de outra máquina do laboratório) na porta passada
    por --porta (padrão: 5000).
 2. Lê a mensagem de login do cliente e responde login_ok, sempre aceitando
    — o objetivo aqui é exercitar o cliente_app.py, não testar lógica de
-   autenticação (isso é responsabilidade do servidor.py real, do Dev A).
+   autenticação (isso é responsabilidade do servidor.py real).
 3. Para cada tipo de mensagem que o cliente pode enviar depois do login,
    responde com uma mensagem fixa e plausível do protocolo, para
    exercitar cada comportamento de cliente_app.py sem depender do
@@ -39,20 +32,16 @@ Comportamento implementado (os 4 passos do TODO original):
        - entrar_sala      -> responde notificacao confirmando a entrada.
        - sair_sala        -> responde notificacao confirmando a volta
                              para a sala geral.
-       - sair             -> encerra a conexão do lado do servidor (o
-                             cliente real, nesta etapa, não chega a
-                             enviar isso — ver encerrar() em
-                             cliente_app.py — mas o stub trata mesmo
-                             assim, por completude do contrato).
+       - sair             -> encerra a conexão do lado do servidor.
        - qualquer outro tipo -> responde com uma mensagem de erro
                              (protocolo.msg_erro), já que não deveria
                              acontecer dado o contrato fechado.
-4. Simulação de queda de conexão (para testar a etapa 5 do
-   cliente_app.py): se o texto de uma mensagem_geral for exatamente
-   "!crash", o stub fecha o socket abruptamente, SEM responder — assim
-   o cliente recebe um recv() vazio (ou ConnectionResetError,
-   dependendo do sistema operacional) no meio da sessão, exatamente o
-   cenário que thread_recepcao()/_encerrar_conexao_forcado() tratam.
+4. Simulação de queda de conexão: se o texto de uma mensagem_geral for
+   exatamente "!crash", o stub fecha o socket abruptamente, sem
+   responder — assim o cliente recebe um recv() vazio (ou
+   ConnectionResetError, dependendo do sistema operacional) no meio da
+   sessão, exatamente o cenário que thread_recepcao()/
+   _encerrar_conexao_forcado() tratam.
 
 Uso:
     python dev_tools/servidor_stub.py --porta 5000
@@ -77,9 +66,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import protocolo
 
 # Texto especial reconhecido só por este stub (não faz parte do
-# protocolo real) para o Dev B forçar uma queda de conexão em qualquer
-# momento da sessão, e assim testar manualmente os caminhos de erro da
-# etapa 5 de cliente_app.py sem precisar desligar o processo do stub.
+# protocolo real) para forçar uma queda de conexão em qualquer momento
+# da sessão, e assim testar manualmente os caminhos de erro de
+# cliente_app.py sem precisar desligar o processo do stub.
 GATILHO_CRASH = "!crash"
 
 
@@ -123,7 +112,7 @@ def _enviar(conexao: socket.socket, mensagem: dict) -> bool:
 
 def _realizar_login(conexao: socket.socket) -> tuple:
     """
-    Passo 2 do TODO: lê a primeira mensagem (deve ser 'login') e responde
+    Lê a primeira mensagem (deve ser 'login') e responde
     login_ok, sempre aceitando o nome recebido.
 
     Retorna (nome, buffer_restante), ou (None, b"") se a conexão caiu
@@ -142,7 +131,7 @@ def _realizar_login(conexao: socket.socket) -> tuple:
 
 def _tratar_mensagem(conexao: socket.socket, nome: str, msg: dict) -> bool:
     """
-    Passo 3 (+ passo 4) do TODO: para cada tipo de mensagem pós-login,
+    Para cada tipo de mensagem pós-login,
     monta e envia a resposta fixa correspondente.
 
     Retorna False quando a sessão deve terminar do lado do stub (recebeu
@@ -205,7 +194,7 @@ def atender_cliente(conexao: socket.socket, endereco) -> None:
     """
     Conduz uma sessão inteira com um único cliente: login, depois loop de
     mensagens até a conexão cair, o cliente enviar 'sair', ou o gatilho
-    de crash (passo 4 do TODO) ser usado.
+    de crash ser usado.
     """
     print(f"[stub] cliente conectado: {endereco}")
     try:
@@ -229,7 +218,7 @@ def atender_cliente(conexao: socket.socket, endereco) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Servidor simulado (stub) para o Dev B testar cliente_app.py isoladamente."
+        description="Servidor simulado (stub) para testar cliente_app.py isoladamente."
     )
     parser.add_argument(
         "--porta", type=int, default=5000,
@@ -246,7 +235,7 @@ def main() -> None:
         servidor.close()
         sys.exit(1)
 
-    servidor.listen(1)  # passo 1 do TODO: uma única conexão por vez, suficiente para teste manual
+    servidor.listen(1)  # uma única conexão por vez, suficiente para teste manual
     print(f"[stub] escutando em 0.0.0.0:{args.porta} (Ctrl+C para encerrar)")
     print(f"[stub] dica: envie '{GATILHO_CRASH}' como mensagem geral para simular queda de conexão.")
 

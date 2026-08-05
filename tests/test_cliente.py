@@ -205,6 +205,83 @@ class TestParseComandoSair(unittest.TestCase):
         self.assertIsNone(msg)
 
 
+class TestParseComandoAjuda(unittest.TestCase):
+    """/ajuda -- reimprime a lista de comandos, 100% local."""
+
+    def test_ajuda_nao_envia_nada_ao_servidor(self):
+        acao, msg = cliente_app.parse_comando("/ajuda")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_ajuda_com_argumento_e_invalido(self):
+        acao, msg = cliente_app.parse_comando("/ajuda alguma_coisa")
+        self.assertEqual(acao, cliente_app.ACAO_INVALIDO)
+        self.assertIsNone(msg)
+
+    def test_ajuda_case_insensitive(self):
+        acao, msg = cliente_app.parse_comando("/AJUDA")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_ajuda_aparece_na_lista_de_comandos(self):
+        """Diferente dos easter eggs, /ajuda é um comando de verdade --
+        precisa aparecer na lista mostrada ao usuário."""
+        self.assertIn(cliente_app.COMANDO_AJUDA, cliente_app.TEXTO_AJUDA_COMANDOS)
+
+    def test_ajuda_imprime_a_lista_de_comandos(self):
+        with contextlib.redirect_stdout(io.StringIO()) as saida:
+            cliente_app.parse_comando("/ajuda")
+        conteudo = saida.getvalue()
+        # confirma que reimprime pelo menos um comando conhecido, não so
+        # uma mensagem generica
+        self.assertIn(cliente_app.COMANDO_PRIV, conteudo)
+        self.assertIn(cliente_app.COMANDO_HISTORICO, conteudo)
+
+
+class TestParseComandoLimpar(unittest.TestCase):
+    """/limpar -- limpa a tela, sem afetar o histórico do servidor."""
+
+    def test_limpar_nao_envia_nada_ao_servidor(self):
+        acao, msg = cliente_app.parse_comando("/limpar")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_limpar_com_argumento_e_invalido(self):
+        acao, msg = cliente_app.parse_comando("/limpar tudo")
+        self.assertEqual(acao, cliente_app.ACAO_INVALIDO)
+        self.assertIsNone(msg)
+
+    def test_limpar_case_insensitive(self):
+        acao, msg = cliente_app.parse_comando("/LIMPAR")
+        self.assertEqual(acao, cliente_app.ACAO_VAZIO)
+        self.assertIsNone(msg)
+
+    def test_limpar_aparece_na_lista_de_comandos(self):
+        self.assertIn(cliente_app.COMANDO_LIMPAR, cliente_app.TEXTO_AJUDA_COMANDOS)
+
+    def test_limpar_envia_sequencia_ansi_quando_e_terminal(self):
+        with patch.object(cliente_app, "_USAR_COR", True):
+            with contextlib.redirect_stdout(io.StringIO()) as saida:
+                cliente_app.parse_comando("/limpar")
+        self.assertIn("\033[2J", saida.getvalue())
+
+    def test_limpar_nao_envia_sequencia_ansi_quando_nao_e_terminal(self):
+        """Saída redirecionada/capturada por teste não deve receber bytes
+        de controle -- eles não fariam sentido nesse contexto."""
+        with patch.object(cliente_app, "_USAR_COR", False):
+            with contextlib.redirect_stdout(io.StringIO()) as saida:
+                cliente_app.parse_comando("/limpar")
+        self.assertNotIn("\033[2J", saida.getvalue())
+
+    def test_limpar_menciona_que_historico_do_servidor_nao_e_afetado(self):
+        """Ponto central do comando, a pedido: limpar a tela não apaga o
+        histórico persistido no servidor."""
+        with patch.object(cliente_app, "_USAR_COR", True):
+            with contextlib.redirect_stdout(io.StringIO()) as saida:
+                cliente_app.parse_comando("/limpar")
+        self.assertIn(cliente_app.COMANDO_HISTORICO, saida.getvalue())
+
+
 class TestParseComandoCafeEasterEgg(unittest.TestCase):
     """/cafe — comando secreto, 100% local (não manda nada ao servidor)."""
 

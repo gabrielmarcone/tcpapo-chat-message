@@ -1,85 +1,231 @@
-# tcpapo-chat-message
+# 💬 tcpapo-chat-message
 
-Sistema de chat em tempo real com arquitetura cliente-servidor via sockets
-TCP, com autenticação por nome único, mensagens gerais e privadas, salas
-temáticas e listagem de usuários conectados.
+> Um chat multiusuário em tempo real, cliente-servidor sobre sockets TCP puros, construído do zero com a biblioteca padrão do Python.
 
-Trabalho prático da disciplina **Redes de Computadores 2**.
+[![Python Version](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Dependências](https://img.shields.io/badge/depend%C3%AAncias%20em%20produ%C3%A7%C3%A3o-nenhuma-brightgreen.svg)](#-tecnologias)
+[![Testes](https://img.shields.io/badge/testes-213%20passing-success.svg)](#-testes)
+[![Status](https://img.shields.io/badge/status-completo-success.svg)](#-funcionalidades)
 
-## Autores
+---
 
-- **Dev A** — [nome completo] — servidor (`modelos.py`, `servidor.py`)
-- **Dev B** — [nome completo] — cliente (`cliente_app.py`)
+## 📌 Sobre o projeto
 
-## Requisitos
+**tcpapo-chat-message** é um sistema de chat em tempo real, com
+arquitetura cliente-servidor clássica sobre **sockets TCP**, feito para
+a disciplina de Redes de Computadores. Sem frameworks, sem
+dependências externas em produção — só `socket`, `threading` e o resto
+da biblioteca padrão do Python, do jeito que a disciplina pede.
 
-- Python 3.10+ (apenas biblioteca padrão: `socket`, `threading`, `json`,
-  `argparse` — nenhuma dependência externa necessária)
-- `pytest` apenas para rodar a suíte de testes (`pip install pytest`)
+O servidor aceita múltiplos clientes simultâneos (uma thread por
+conexão), autentica com senha, organiza conversas em salas, guarda
+histórico de mensagens em disco e ainda deixa tudo bonito no terminal —
+com cor por usuário, símbolos de status, e uns easter eggs pra alegrar
+a demonstração.
 
-## Como executar
+---
 
-**Servidor** (escuta em todas as interfaces de rede, `0.0.0.0`):
+## 🏗️ Arquitetura
+
+Projeto em módulos, cada um com uma responsabilidade única:
+
+```text
+tcpapo-chat-message/
+├── protocolo.py      # Vocabulário comum: tipos de mensagem, serialização JSON e framing
+├── modelos.py         # Estado do servidor: Cliente e RegistroClientes (thread-safe)
+├── persistencia.py    # Histórico de mensagens em SQLite
+├── usuarios.py         # Cadastro de usuários e autenticação por senha (SQLite)
+├── servidor.py          # Servidor TCP: accept loop, login, roteamento de mensagens
+└── cliente_app.py        # Cliente de terminal: conexão, comandos, interface colorida
+```
+
+**Servidor**: uma thread principal em loop de `accept()`; cada cliente
+aceito ganha sua própria thread, do login até a desconexão.
+**Protocolo**: mensagens JSON, uma por linha, delimitadas por `\n` —
+simples e tolerante a fragmentação do TCP.
+**Concorrência**: um lock global serializa eventos que precisam manter
+ordem (login, troca de sala); cada cliente tem seu próprio lock de
+envio, pra mensagens de threads diferentes nunca se misturarem no
+mesmo socket.
+
+---
+
+## ⚡ Funcionalidades
+
+### 🟢 Núcleo
+- [x] Comunicação em tempo real entre múltiplos clientes via TCP
+- [x] Servidor multi-thread (uma thread por cliente conectado)
+- [x] Protocolo próprio: mensagens JSON com framing por linha
+- [x] Nome de usuário único, sem distinção de maiúsculas/minúsculas
+- [x] Mensagens gerais (broadcast restrito à sala do remetente)
+- [x] Mensagens privadas entre usuários
+- [x] Notificação automática de entrada/saída
+- [x] Listagem de usuários conectados, com a sala de cada um
+- [x] Salas temáticas, criadas livremente (`/entrar <sala>`)
+- [x] Encerramento controlado (`/sair`) e tratamento de queda abrupta
+
+### 🔒 Persistência & segurança
+- [x] Cadastro automático no primeiro login (sem etapa separada de "criar conta")
+- [x] Senha protegida com **hash + salt aleatório por usuário**, nunca gravada em texto puro
+- [x] Comparação de senha em **tempo constante** (`hmac.compare_digest`), contra timing attack
+- [x] Histórico de mensagens persistente em SQLite, sobrevive a reinícios do servidor
+- [x] Histórico isolado automaticamente por porta (duas instâncias nunca misturam dados sem querer)
+
+### 🎨 Interface de terminal
+- [x] Cor consistente por usuário (estilo IRC/Discord antigo, hash do nome → cor)
+- [x] Mensagens de sistema com símbolo padronizado (✓ sucesso, ✗ erro, ⚠ aviso)
+- [x] Sua própria mensagem enviada aparece destacada, diferente das dos outros
+- [x] Timestamps em todas as mensagens
+
+### 🐣 Easter eggs
+- **`/cafe`** — porque toda madrugada de código precisa de uma pausa
+- **`/minecraft`** — um creeper em ASCII art, bem verde
+- **`/batman`** — o sinal do morcego, pra quando o bug já é meia-noite
+
+---
+
+## 🛠️ Tecnologias
+
+Todo o programa roda só com a **biblioteca padrão do Python** — zero
+dependência externa para usar o chat:
+
+| Módulo | Uso no projeto |
+| :--- | :--- |
+| [`socket`](https://docs.python.org/3/library/socket.html) | Comunicação TCP cliente-servidor |
+| [`threading`](https://docs.python.org/3/library/threading.html) | Uma thread por cliente no servidor; thread de recepção no cliente |
+| [`json`](https://docs.python.org/3/library/json.html) | Serialização das mensagens do protocolo |
+| [`argparse`](https://docs.python.org/3/library/argparse.html) | Configuração via linha de comando |
+| [`sqlite3`](https://docs.python.org/3/library/sqlite3.html) | Persistência de histórico e cadastro de usuários |
+| [`hashlib`](https://docs.python.org/3/library/hashlib.html) / [`hmac`](https://docs.python.org/3/library/hmac.html) / [`secrets`](https://docs.python.org/3/library/secrets.html) | Hash de senha com salt e comparação segura |
+| [`getpass`](https://docs.python.org/3/library/getpass.html) | Senha digitada sem eco no terminal |
+
+**Só para desenvolvimento** (não é necessário pra rodar o chat):
+
+- [`pytest`](https://docs.pytest.org/) — suíte de testes automatizados
+- [`pytest-cov`](https://pytest-cov.readthedocs.io/) — relatório de cobertura
+
+---
+
+## 🚀 Começando
+
+### Pré-requisitos
+
+- **Python 3.10+**
+
+### Instalação
 
 ```bash
+git clone https://github.com/gabrielmarcone/tcpapo-chat-message.git
+cd tcpapo-chat-message
+```
+
+Não tem nenhuma instalação a fazer pra rodar o chat em si — é só
+Python puro. Se quiser rodar os testes também:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate       # Linux/Mac
+.venv\Scripts\activate          # Windows
+
+pip install pytest pytest-cov
+```
+
+---
+
+## 💻 Executando
+
+### 1. Suba o servidor
+
+```bash
+# porta padrão: 5000, escutando em todas as interfaces de rede
 python servidor.py --porta 5000
 ```
 
-**Cliente** (aponte para o IP real da máquina que está rodando o
-servidor — nunca `localhost`/`127.0.0.1` no dia do teste em laboratório):
+<details>
+<summary>Outras opções do servidor</summary>
+
+| Argumento | Padrão | Descrição |
+| :--- | :--- | :--- |
+| `--porta` | `5000` | Porta TCP de escuta |
+| `--banco` | isolado por porta | Arquivo SQLite do histórico (padrão: `chat_historico_<porta>.db`) |
+| `--banco-usuarios` | `chat_usuarios.db` | Arquivo SQLite do cadastro de usuários |
+
+</details>
+
+### 2. Conecte um cliente
+
+Em outro terminal (ou outra máquina da rede):
 
 ```bash
-python cliente_app.py --ip 192.168.0.10 --porta 5000
+python cliente_app.py --ip 127.0.0.1 --porta 5000
 ```
 
-Para descobrir o IP da máquina-servidor no laboratório:
+> Troque `127.0.0.1` pelo IP real do servidor se estiver testando
+> entre máquinas diferentes (`ipconfig` no Windows, `ip addr` no
+> Linux/Mac). O servidor escuta em `0.0.0.0`, então aceita conexões de
+> qualquer máquina da rede local — só cuide da liberação de firewall na
+> máquina que roda o servidor.
 
-- Windows: `ipconfig`
-- Linux/Mac: `ip addr` ou `ifconfig`
+Ao conectar, escolha um apelido e uma senha. Primeiro login com um nome
+novo já cadastra a senha; nos seguintes, a mesma senha é exigida.
 
-## Comandos disponíveis no cliente
+---
 
-| Comando | Efeito |
-|---|---|
-| `<texto livre>` | Mensagem para todos na sala atual (chat geral, por padrão) |
-| `/priv <nome> <texto>` | Mensagem privada para `<nome>` |
-| `/lista` | Lista todos os usuários conectados e a sala de cada um |
-| `/entrar <sala>` | Entra (ou cria) a sala `<sala>` |
-| `/sair_sala` | Volta para a sala `"geral"` |
-| `/sair` | Encerra a conexão de forma controlada |
+## 💬 Comandos disponíveis
 
-## Estrutura do projeto
+| Comando | Descrição | Exemplo |
+| :--- | :--- | :--- |
+| `<texto livre>` | Mensagem para a sala atual | `oi pessoal` |
+| `/priv <usuario> <mensagem>` | Mensagem privada | `/priv alice oi!` |
+| `/lista` | Lista usuários conectados e suas salas | `/lista` |
+| `/entrar <sala>` | Entra numa sala (criada se não existir) | `/entrar jogos` |
+| `/sair_sala` | Volta para a sala `"geral"` | `/sair_sala` |
+| `/historico [quantidade]` | Mensagens recentes da sala atual (padrão 20, máx. 100) | `/historico 5` |
+| `/sair` | Encerra a conexão | `/sair` |
+| `Ctrl+C` | Encerra a conexão a qualquer momento | — |
 
-```
-tcpapo-chat-message/
-├── protocolo.py          # Protocolo de aplicação (Conjunto)
-├── modelos.py             # Estruturas de dados do servidor (Dev A)
-├── servidor.py            # Servidor (Dev A)
-├── cliente_app.py         # Cliente (Dev B)
-├── dev_tools/
-│   ├── cliente_stub.py    # Cliente simulado p/ testar o servidor isolado (Dev A)
-│   └── servidor_stub.py   # Servidor simulado p/ testar o cliente isolado (Dev B)
-├── tests/
-│   ├── test_protocolo.py  # Testes do protocolo (Conjunto)
-│   ├── test_servidor.py   # Testes do servidor (Dev A)
-│   └── test_cliente.py    # Testes do cliente (Dev B)
-├── relatorio/
-│   └── relatorio.md
-├── README.md
-└── .gitignore
-```
+Nomes de usuário e sala: sem espaço, até 30 caracteres, sem distinção
+de maiúsculas/minúsculas.
 
-Ver `relatorio/relatorio.md` para arquitetura detalhada, justificativa
-TCP/UDP e descrição completa do protocolo.
+---
 
-## Testes
+## 🧪 Testes
 
 ```bash
-python -m pytest tests/
+python -m pytest tests/ -v
 ```
 
-## Protocolo de aplicação
+213 testes, cobrindo desde os módulos isolados até testes de
+integração que sobem um servidor real e conectam clientes de teste de
+verdade nele — login, broadcast, salas, privadas, histórico e
+concorrência, tudo de ponta a ponta.
 
-Mensagens são objetos JSON, uma por linha, delimitadas por `\n`. Ver
-`protocolo.py` para a lista completa de tipos de mensagem e a seção 2 do
-relatório técnico para a descrição detalhada.
+Com relatório de cobertura:
+
+```bash
+python -m pytest tests/ --cov=modelos --cov=protocolo --cov=persistencia --cov=usuarios --cov=servidor --cov-report=term-missing
+```
+
+---
+
+## 📄 Protocolo
+
+Mensagens são objetos JSON, um por linha, delimitados por `\n`:
+
+```json
+{"tipo": "login", "nome": "alice", "senha": "minhasenha"}
+```
+
+Todo o vocabulário do protocolo vive em `protocolo.py` — nenhuma outra
+parte do projeto monta ou interpreta JSON manualmente. Detalhes
+completos da arquitetura e das decisões de design em
+`relatorio/relatorio.md`.
+
+---
+
+## 👥 Autores
+
+Trabalho desenvolvido em dupla para a disciplina de Redes de Computadores 2.
+
+- **Caio Cordeiro Matos** - [GitHub](https://github.com/ccaiomatos)
+- **Gabriel Marcone Magalhães Santos** — [GitHub](https://github.com/gabrielmarcone)

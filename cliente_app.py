@@ -591,6 +591,8 @@ COMANDO_ENTRAR = "/entrar"
 COMANDO_SAIR_SALA = "/sair_sala"
 COMANDO_SAIR = "/sair"
 COMANDO_HISTORICO = "/historico"
+COMANDO_AJUDA = "/ajuda"
+COMANDO_LIMPAR = "/limpar"
 COMANDO_CAFE = "/cafe"  # easter egg -- de propósito não entra em TEXTO_AJUDA_COMANDOS
 COMANDO_MINECRAFT = "/minecraft"  # idem
 COMANDO_BATMAN = "/batman"  # idem
@@ -601,9 +603,45 @@ TEXTO_AJUDA_COMANDOS = (
     f"  {COMANDO_ENTRAR} <sala>               entra em uma sala\n"
     f"  {COMANDO_SAIR_SALA}                   volta para a sala geral\n"
     f"  {COMANDO_HISTORICO} [quantidade]      mostra mensagens recentes da sala atual\n"
+    f"  {COMANDO_AJUDA}                       mostra esta lista de comandos novamente\n"
+    f"  {COMANDO_LIMPAR}                      limpa a tela (histórico do servidor não é afetado)\n"
     f"  {COMANDO_SAIR}                        encerra a conexão\n"
     "  <texto livre>                  mensagem para o chat geral"
 )
+
+
+def _imprimir_bloco_comandos() -> None:
+    """Bloco de ajuda usado tanto na tela de boas-vindas quanto por /ajuda,
+    para as duas exibições nunca ficarem dessincronizadas entre si."""
+    print(_c(" Comandos:", _Cor.CINZA))
+    print(TEXTO_AJUDA_COMANDOS)
+
+
+def _mostrar_ajuda() -> Tuple[str, None]:
+    """/ajuda -- reimprime a lista de comandos, exatamente como aparece
+    ao conectar. 100% local, não manda nada ao servidor."""
+    _imprimir_bloco_comandos()
+    return ACAO_VAZIO, None
+
+
+def _limpar_tela() -> Tuple[str, None]:
+    """
+    /limpar -- limpa a tela do terminal. Afeta só o que está visível
+    localmente neste momento: o histórico de mensagens continua salvo
+    no servidor (SQLite) e pode ser consultado a qualquer momento com
+    /historico, mesmo depois de limpar a tela.
+
+    Sequência ANSI de limpeza só é enviada se a saída for um terminal
+    de verdade (_USAR_COR) -- em saída redirecionada/capturada por
+    teste, os bytes de controle não fariam sentido nenhum e só
+    sujariam o resultado.
+    """
+    if _USAR_COR:
+        print("\033[2J\033[H", end="")
+        _info("tela limpa — o histórico do servidor continua intacto (use /historico para consultá-lo).")
+    else:
+        _aviso(f"{COMANDO_LIMPAR} não tem efeito quando a saída não é um terminal.")
+    return ACAO_VAZIO, None
 
 _ARTE_CAFE = r"""
           ( (
@@ -748,6 +786,16 @@ def parse_comando(texto: str) -> Tuple[str, Optional[dict]]:
             return _comando_invalido(f"{COMANDO_SAIR} não aceita argumentos")
         return ACAO_SAIR, None
 
+    if comando == COMANDO_AJUDA:
+        if resto:
+            return _comando_invalido(f"{COMANDO_AJUDA} não aceita argumentos")
+        return _mostrar_ajuda()
+
+    if comando == COMANDO_LIMPAR:
+        if resto:
+            return _comando_invalido(f"{COMANDO_LIMPAR} não aceita argumentos")
+        return _limpar_tela()
+
     if comando == COMANDO_CAFE:
         return _mostrar_easter_egg_cafe()
 
@@ -833,8 +881,7 @@ def main() -> None:
         print(f" Digite uma mensagem e Enter para enviar ao chat geral.")
         print(f" {_c(COMANDO_SAIR, _Cor.NEGRITO)} ou Ctrl+C encerra a qualquer momento.")
         print(linha)
-        print(_c(" Comandos:", _Cor.CINZA))
-        print(TEXTO_AJUDA_COMANDOS)
+        _imprimir_bloco_comandos()
         print(linha)
 
         while not evento_encerrando.is_set():

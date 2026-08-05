@@ -38,6 +38,7 @@ def main() -> None:
     parser.add_argument("--ip", required=True, help="IP do servidor")
     parser.add_argument("--porta", type=int, required=True, help="Porta do servidor")
     parser.add_argument("--nome", default="stub", help="Nome de login a usar (padrao: stub)")
+    parser.add_argument("--senha", default="stub123", help="Senha de login a usar (padrao: stub123)")
     args = parser.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -64,7 +65,7 @@ def main() -> None:
             buffer += dados
 
     # --- sequência de teste manual ---
-    enviar(protocolo.msg_login(args.nome))
+    enviar(protocolo.msg_login(args.nome, args.senha))
     resposta = receber_uma()
     if resposta["tipo"] != protocolo.TIPO_LOGIN_OK:
         print("Login falhou, encerrando.")

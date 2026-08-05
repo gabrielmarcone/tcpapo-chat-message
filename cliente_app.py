@@ -38,6 +38,7 @@ import socket
 import sys
 import threading
 from datetime import datetime
+from getpass import getpass
 from typing import Optional, Tuple
 
 import protocolo
@@ -314,8 +315,14 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
                 _aviso("o apelido não pode ser vazio.")
                 continue
 
+            # NOVO — pede a senha. getpass() não ecoa o que é digitado.
+            senha = getpass("Senha: ")
+            if not senha:
+                _aviso("a senha não pode ser vazia.")
+                continue
+
             try:
-                sock.sendall(protocolo.serializar(protocolo.msg_login(nome)))
+                sock.sendall(protocolo.serializar(protocolo.msg_login(nome, senha)))
             except (BrokenPipeError, ConnectionResetError):
                 _erro("conexão perdida ao enviar login.")
                 sock.close()

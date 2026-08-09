@@ -285,6 +285,122 @@ def conectar(ip: str, porta: int) -> socket.socket:
 
 
 # --------------------------------------------------------------------------
+# Descoberta automática de servidor (UDP)
+# --------------------------------------------------------------------------
+# Alternativa a informar --ip manualmente: manda um pedido por broadcast
+# UDP na rede local e usa quem responder. Só funciona dentro do mesmo
+# segmento de rede (broadcast não atravessa roteador) e pode ser
+# bloqueado por redes Wi-Fi com "isolamento de cliente" ativado — por
+# isso continua sendo uma opção adicional, nunca a única forma de
+# conectar (ver validar_argumentos_conexao / --ip continua existindo e
+# funcionando exatamente como antes).
+
+def descobrir_servidor(porta_descoberta: int, tempo_espera: float = 3.0) -> list:
+    """
+    Manda um pedido de descoberta via UDP broadcast na rede local e
+    devolve a lista de (ip, porta_tcp) de todo servidor que respondeu
+    dentro de `tempo_espera` segundos.
+
+    Usa o endereço de broadcast limitado (255.255.255.255) de propósito:
+    ele sempre significa "toda a rede local", sem o cliente precisar
+    calcular o endereço de broadcast da sub-rede específica em que está
+    (o que exigiria inspecionar as interfaces de rede da máquina).
+    SO_BROADCAST precisa ser habilitado explicitamente no socket — por
+    padrão, o sistema operacional bloqueia esse tipo de envio, como
+    proteção contra uso indevido de broadcast por engano.
+
+    Nunca levanta exceção por timeout nem por nenhum servidor responder
+    — lista vazia é um resultado válido e esperado (por exemplo, se a
+    rede bloquear broadcast, ou se não houver servidor algum rodando).
+    Quem chama (escolher_servidor_descoberto) decide o que fazer com uma
+    lista vazia.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    sock.settimeout(0.5)
+
+    try:
+        sock.sendto(
+            protocolo.serializar(protocolo.msg_descobrir_servidor()),
+            ("255.255.255.255", porta_descoberta),
+        )
+    except OSError as erro:
+        _erro(f"não foi possível enviar o pedido de descoberta ({erro}).")
+        sock.close()
+        return []
+
+    encontrados = []
+    limite = time.time() + tempo_espera
+    while time.time() < limite:
+        try:
+            dados, endereco = sock.recvfrom(4096)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+
+        try:
+            mensagens, _ = protocolo.extrair_mensagens(dados)
+        except protocolo.ErroProtocolo:
+            continue  # resposta não reconhecida — ignora, sem derrubar a busca
+
+        for msg in mensagens:
+            if msg.get("tipo") != protocolo.TIPO_SERVIDOR_AQUI:
+                continue
+            porta_tcp = msg.get("porta_tcp")
+            if not isinstance(porta_tcp, int):
+                continue
+            ip_encontrado = endereco[0]
+            par = (ip_encontrado, porta_tcp)
+            if par not in encontrados:
+                encontrados.append(par)
+                _ok(f"servidor encontrado em {ip_encontrado}:{porta_tcp}")
+
+    sock.close()
+    return encontrados
+
+
+def escolher_servidor_descoberto(encontrados: list) -> Tuple[str, int]:
+    """
+    Decide, a partir da lista devolvida por descobrir_servidor(), qual
+    servidor usar:
+        - nenhum encontrado -> encerra o programa com mensagem clara,
+          sugerindo --ip manual como alternativa;
+        - exatamente um -> usa ele direto, sem perguntar nada ao usuário;
+        - mais de um -> mostra a lista numerada e pede para escolher.
+          Pode acontecer de verdade (mais de um grupo rodando servidor
+          na mesma rede do laboratório, por exemplo), então precisa ser
+          tratado, não só assumido como caso raro.
+    """
+    if not encontrados:
+        _erro(
+            "nenhum servidor respondeu à descoberta automática. Isso pode "
+            "acontecer se a rede bloquear tráfego de broadcast (comum em "
+            "Wi-Fi de instituições, por segurança) ou se nenhum servidor "
+            "estiver rodando agora."
+        )
+        print(f"{_c('[dica]', _Cor.CINZA)} use --ip para conectar informando o endereço manualmente.")
+        sys.exit(1)
+
+    if len(encontrados) == 1:
+        return encontrados[0]
+
+    print(f"{_c(' Mais de um servidor encontrado na rede:', _Cor.AMARELO)}")
+    for indice, (ip, porta) in enumerate(encontrados, start=1):
+        print(f"  {indice}. {ip}:{porta}")
+
+    while True:
+        try:
+            escolha = input("Escolha um número: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            _info("descoberta cancelada pelo usuário.")
+            sys.exit(0)
+        if escolha.isdigit() and 1 <= int(escolha) <= len(encontrados):
+            return encontrados[int(escolha) - 1]
+        _aviso(f"digite um número entre 1 e {len(encontrados)}.")
+
+
+# --------------------------------------------------------------------------
 # Impressão de mensagens recebidas do servidor
 # --------------------------------------------------------------------------
 # Função compartilhada entre realizar_login() (mensagens que cheguem antes
@@ -1114,20 +1230,36 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Cliente de chat (protocolo tcpapo-chat-message)"
     )
-    parser.add_argument(
-        "--ip", required=True,
-        help="IP do servidor (obrigatório; não use localhost/127.0.0.1 fixo no código)",
+    grupo_conexao = parser.add_mutually_exclusive_group(required=True)
+    grupo_conexao.add_argument(
+        "--ip",
+        help="IP do servidor (não use localhost/127.0.0.1 fixo no código)",
+    )
+    grupo_conexao.add_argument(
+        "--descobrir", action="store_true",
+        help="Descobre o servidor automaticamente na rede local via UDP broadcast, em vez de indicar --ip",
     )
     parser.add_argument(
         "--porta", type=validar_porta, default=5000,
-        help="Porta do servidor (padrão: 5000)",
+        help="Porta do servidor (padrão: 5000; ignorada se --descobrir for usado, "
+             "já que a porta vem da resposta do servidor encontrado)",
+    )
+    parser.add_argument(
+        "--porta-descoberta", type=validar_porta, default=protocolo.PORTA_DESCOBERTA_PADRAO,
+        help=f"Porta UDP usada para a descoberta automática (padrão: {protocolo.PORTA_DESCOBERTA_PADRAO})",
     )
     args = parser.parse_args()
 
-    ip = args.ip.strip()
-    if not ip:
-        _erro("--ip não pode ser vazio.")
-        sys.exit(1)
+    if args.descobrir:
+        _info("procurando servidor na rede local via UDP broadcast...")
+        encontrados = descobrir_servidor(args.porta_descoberta)
+        ip, porta_alvo = escolher_servidor_descoberto(encontrados)
+    else:
+        ip = args.ip.strip()
+        if not ip:
+            _erro("--ip não pode ser vazio.")
+            sys.exit(1)
+        porta_alvo = args.porta
 
     # sock, estado, thread começam como None: em caso de erro/Ctrl+C bem
     # no início (antes de existirem), o bloco finally abaixo sabe o que
@@ -1139,13 +1271,13 @@ def main() -> None:
     evento_encerrando: Optional[threading.Event] = None
 
     try:
-        sock = conectar(ip, args.porta)
+        sock = conectar(ip, porta_alvo)
         nome, senha, buffer_inicial = realizar_login(sock)
 
         evento_encerrando = threading.Event()
         estado = EstadoCliente()
         estado.ip = ip
-        estado.porta = args.porta
+        estado.porta = porta_alvo
         estado.nome = nome
         estado.senha = senha
         estado.sock = sock

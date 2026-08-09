@@ -1736,3 +1736,226 @@ def test_formatar_endereco_valor_inesperado_nao_quebra():
     """
     assert servidor._formatar_endereco(None) == "None"
     assert servidor._formatar_endereco(42) == "42"
+
+
+# ==============================================================================
+# Descoberta automática de servidor (UDP)
+# ==============================================================================
+
+@pytest.fixture
+def socket_descoberta_livre():
+    """Cria o socket de descoberta numa porta livre escolhida pelo SO
+    (porta=0), no mesmo espírito do padrão já usado para o socket TCP
+    principal nos testes existentes."""
+    sock = servidor.criar_socket_descoberta(0)
+    assert sock is not None
+    yield sock
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def test_criar_socket_descoberta_sucesso(socket_descoberta_livre):
+    porta = socket_descoberta_livre.getsockname()[1]
+    assert porta > 0
+
+
+def test_criar_socket_descoberta_devolve_none_se_porta_ja_em_uso():
+    """
+    Não deve levantar exceção nem derrubar o processo -- é um recurso
+    adicional; se a porta já estiver ocupada, quem chama decide como
+    avisar, sem que o servidor inteiro pare de funcionar por isso.
+    """
+    ocupante = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ocupante.bind(("0.0.0.0", 0))
+    porta_ocupada = ocupante.getsockname()[1]
+    try:
+        resultado = servidor.criar_socket_descoberta(porta_ocupada)
+        assert resultado is None
+    finally:
+        ocupante.close()
+
+
+def test_duas_instancias_reais_na_mesma_porta_de_descoberta_o_segundo_falha():
+    """
+    Regressão: a primeira versão desta função usava SO_REUSEADDR no
+    socket UDP, o que no Linux tem uma semântica bem mais permissiva do
+    que em TCP -- permite que DOIS processos façam bind na MESMA porta
+    UDP ao mesmo tempo, sem erro nenhum, com os datagramas indo
+    imprevisivelmente para um processo ou para o outro. Esse
+    comportamento só aparece quando OS DOIS lados usam SO_REUSEADDR
+    (por isso o teste acima, com um socket comum como "ocupante", não
+    era suficiente para pegar o problema) -- este teste reproduz o
+    cenário real: duas chamadas de criar_socket_descoberta() de
+    verdade, a mesma função usada pelas duas instâncias do servidor.
+    """
+    primeiro = servidor.criar_socket_descoberta(0)
+    assert primeiro is not None
+    porta = primeiro.getsockname()[1]
+    try:
+        segundo = servidor.criar_socket_descoberta(porta)
+        assert segundo is None
+    finally:
+        primeiro.close()
+
+
+def test_loop_descoberta_responde_a_pedido_valido(socket_descoberta_livre):
+    porta_descoberta = socket_descoberta_livre.getsockname()[1]
+    porta_tcp_fake = 12345
+
+    thread = threading.Thread(
+        target=servidor.loop_descoberta,
+        args=(socket_descoberta_livre, porta_tcp_fake),
+        daemon=True,
+    )
+    thread.start()
+
+    cliente_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cliente_udp.settimeout(3.0)
+    try:
+        cliente_udp.sendto(
+            protocolo.serializar(protocolo.msg_descobrir_servidor()),
+            ("127.0.0.1", porta_descoberta),
+        )
+        dados, _ = cliente_udp.recvfrom(4096)
+        mensagens, _ = protocolo.extrair_mensagens(dados)
+        assert len(mensagens) == 1
+        assert mensagens[0]["tipo"] == protocolo.TIPO_SERVIDOR_AQUI
+        assert mensagens[0]["porta_tcp"] == porta_tcp_fake
+    finally:
+        cliente_udp.close()
+        socket_descoberta_livre.close()
+        thread.join(timeout=2)
+
+
+def test_loop_descoberta_ignora_datagrama_malformado_sem_derrubar(socket_descoberta_livre):
+    """Lixo/datagrama fora do formato do protocolo não pode derrubar a
+    thread de descoberta -- ela precisa continuar escutando depois."""
+    porta_descoberta = socket_descoberta_livre.getsockname()[1]
+
+    thread = threading.Thread(
+        target=servidor.loop_descoberta,
+        args=(socket_descoberta_livre, 12345),
+        daemon=True,
+    )
+    thread.start()
+
+    cliente_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cliente_udp.settimeout(2.0)
+    try:
+        # datagrama que nao eh JSON valido nenhum
+        cliente_udp.sendto(b"isso nao e um json valido\n", ("127.0.0.1", porta_descoberta))
+        # a thread nao deve morrer por causa disso -- confirma mandando
+        # um pedido valido em seguida e esperando resposta normal
+        cliente_udp.sendto(
+            protocolo.serializar(protocolo.msg_descobrir_servidor()),
+            ("127.0.0.1", porta_descoberta),
+        )
+        dados, _ = cliente_udp.recvfrom(4096)
+        mensagens, _ = protocolo.extrair_mensagens(dados)
+        assert mensagens[0]["tipo"] == protocolo.TIPO_SERVIDOR_AQUI
+    finally:
+        cliente_udp.close()
+        socket_descoberta_livre.close()
+        thread.join(timeout=2)
+
+
+def test_loop_descoberta_ignora_tipo_de_mensagem_diferente(socket_descoberta_livre):
+    """Um datagrama bem formado, mas de um tipo que não é pedido de
+    descoberta, deve ser ignorado silenciosamente -- não gera resposta
+    nenhuma."""
+    porta_descoberta = socket_descoberta_livre.getsockname()[1]
+
+    thread = threading.Thread(
+        target=servidor.loop_descoberta,
+        args=(socket_descoberta_livre, 12345),
+        daemon=True,
+    )
+    thread.start()
+
+    cliente_udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    cliente_udp.settimeout(1.0)
+    try:
+        cliente_udp.sendto(
+            protocolo.serializar(protocolo.msg_login("alice", "senha123")),
+            ("127.0.0.1", porta_descoberta),
+        )
+        with pytest.raises(socket.timeout):
+            cliente_udp.recvfrom(4096)  # nao deve vir resposta nenhuma
+    finally:
+        cliente_udp.close()
+        socket_descoberta_livre.close()
+        thread.join(timeout=2)
+
+
+def test_loop_descoberta_encerra_quando_socket_e_fechado_externamente(socket_descoberta_livre):
+    thread = threading.Thread(
+        target=servidor.loop_descoberta,
+        args=(socket_descoberta_livre, 12345),
+        daemon=True,
+    )
+    thread.start()
+    time.sleep(0.1)
+    socket_descoberta_livre.close()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_main_com_sem_descoberta_nao_cria_socket_de_descoberta(tmp_path, monkeypatch):
+    """--sem-descoberta deve funcionar mesmo com a porta de descoberta
+    padrão ocupada por outra coisa -- confirma que main() nem tenta
+    abrir o socket nesse caso."""
+    ocupante = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ocupante.bind(("0.0.0.0", 0))
+    porta_ocupada = ocupante.getsockname()[1]
+    try:
+        monkeypatch.setattr(
+            sys, "argv",
+            [
+                "servidor.py", "--porta", "0",
+                "--banco", ":memory:", "--banco-usuarios", ":memory:",
+                "--porta-descoberta", str(porta_ocupada),
+                "--sem-descoberta",
+            ],
+        )
+
+        def parar_logo(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(servidor, "loop_accept", parar_logo)
+        # nao deve levantar nenhum erro relacionado a porta UDP ocupada,
+        # já que --sem-descoberta nem tenta usá-la
+        servidor.main()
+    finally:
+        ocupante.close()
+
+
+def test_main_continua_funcionando_se_porta_de_descoberta_estiver_ocupada(monkeypatch):
+    """
+    Ponto central do design: uma falha ao abrir o socket de descoberta
+    (porta já em uso) NUNCA deve impedir o servidor TCP de subir
+    normalmente -- é só um aviso, não um erro fatal.
+    """
+    ocupante = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ocupante.bind(("0.0.0.0", 0))
+    porta_ocupada = ocupante.getsockname()[1]
+    try:
+        monkeypatch.setattr(
+            sys, "argv",
+            [
+                "servidor.py", "--porta", "0",
+                "--banco", ":memory:", "--banco-usuarios", ":memory:",
+                "--porta-descoberta", str(porta_ocupada),
+            ],
+        )
+
+        def parar_logo(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        monkeypatch.setattr(servidor, "loop_accept", parar_logo)
+        # main() deve rodar até o fim sem lançar nenhuma exceção, mesmo
+        # com a porta de descoberta ocupada
+        servidor.main()
+    finally:
+        ocupante.close()

@@ -8,6 +8,14 @@ Escopo:
     - TestEnviar: cobre enviar() com um socket mockado (unittest.mock),
       validando que cada tipo de falha de rede é tratado sem levantar
       exceção para quem chama.
+    - Reconexão automática (TestTentarConectarUmaVez,
+      TestRelogarAutomaticamente, TestDormirInterrompivel,
+      TestTentarReconectar, TestReceberAteCair,
+      TestSupervisionarConexaoIntegracao): cobrem a lógica de espera
+      exponencial, reautenticação automática, restauração de sala e
+      pedido de histórico após uma queda inesperada de conexão — tudo
+      com sockets mockados, para não depender de um servidor real nem
+      de tempos de espera longos.
 
 Não testamos aqui: conectar()/realizar_login()/main() fim-a-fim — essas
 funções terminam o processo (sys.exit) ou bloqueiam em input()/recv(),
@@ -20,8 +28,10 @@ import contextlib
 import io
 import os
 import sys
+import threading
+import time
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, ".")
 
@@ -543,6 +553,512 @@ class TestMensagensDeSistema(unittest.TestCase):
             cliente_app._info("mensagem de teste")
         self.assertIn("[info]", saida.getvalue())
         self.assertNotIn("ℹ", saida.getvalue())
+
+
+# ==============================================================================
+# Reconexão automática
+# ==============================================================================
+
+class TestEstadoClienteCamposDeConexao(unittest.TestCase):
+    """EstadoCliente precisa guardar tudo que a reconexão automática
+    precisa para reconectar e reautenticar sozinha, além da sala atual
+    já existente antes desta funcionalidade."""
+
+    def test_campos_novos_comecam_none(self):
+        estado = cliente_app.EstadoCliente()
+        self.assertIsNone(estado.ip)
+        self.assertIsNone(estado.porta)
+        self.assertIsNone(estado.nome)
+        self.assertIsNone(estado.senha)
+        self.assertIsNone(estado.sock)
+
+    def test_sala_atual_continua_geral_por_padrao(self):
+        """Não pode quebrar o comportamento já existente."""
+        estado = cliente_app.EstadoCliente()
+        self.assertEqual(estado.sala_atual, "geral")
+
+    def test_tem_lock_para_protecao_concorrente_do_socket(self):
+        estado = cliente_app.EstadoCliente()
+        self.assertTrue(hasattr(estado, "lock"))
+        # precisa se comportar como um lock de verdade (usável em "with")
+        with estado.lock:
+            pass
+
+
+class TestTentarConectarUmaVez(unittest.TestCase):
+    """
+    _tentar_conectar_uma_vez() é a base tanto da primeira conexão
+    (conectar()) quanto da reconexão automática -- mas, diferente de
+    conectar(), NUNCA encerra o processo: sempre devolve (socket, None)
+    ou (None, motivo), não importa o que aconteça.
+    """
+
+    def test_sucesso_devolve_socket_e_none(self):
+        sock_mock = MagicMock()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            sock, motivo = cliente_app._tentar_conectar_uma_vez("192.0.2.1", 5000)
+        self.assertIs(sock, sock_mock)
+        self.assertIsNone(motivo)
+        sock_mock.settimeout.assert_any_call(None)  # timeout removido após sucesso
+
+    def test_falha_devolve_none_e_motivo_sem_levantar_excecao(self):
+        sock_mock = MagicMock()
+        sock_mock.connect.side_effect = ConnectionRefusedError()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            sock, motivo = cliente_app._tentar_conectar_uma_vez("192.0.2.1", 5000)
+        self.assertIsNone(sock)
+        self.assertIsNotNone(motivo)
+        self.assertIn("recusada", motivo)
+        sock_mock.close.assert_called_once()
+
+    def test_timeout_tem_mensagem_especifica(self):
+        import socket as socket_module
+        sock_mock = MagicMock()
+        sock_mock.connect.side_effect = socket_module.timeout()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            sock, motivo = cliente_app._tentar_conectar_uma_vez("192.0.2.1", 5000)
+        self.assertIsNone(sock)
+        self.assertIn("esgotado", motivo)
+
+    def test_keyboard_interrupt_fecha_socket_e_repropaga(self):
+        """Precisa fechar o socket ANTES de repropagar, senão vaza o
+        descritor -- conectar() (chamador) depende disso pra encerrar
+        de forma limpa num Ctrl+C durante a conexão."""
+        sock_mock = MagicMock()
+        sock_mock.connect.side_effect = KeyboardInterrupt()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            with self.assertRaises(KeyboardInterrupt):
+                cliente_app._tentar_conectar_uma_vez("192.0.2.1", 5000)
+        sock_mock.close.assert_called_once()
+
+    def test_conectar_continua_encerrando_processo_em_caso_de_falha(self):
+        """conectar() (usada na primeira conexão) precisa continuar
+        chamando sys.exit -- só a reconexão automática usa a variante
+        que não encerra o processo."""
+        sock_mock = MagicMock()
+        sock_mock.connect.side_effect = ConnectionRefusedError()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            with self.assertRaises(SystemExit):
+                cliente_app.conectar("192.0.2.1", 5000)
+
+
+class TestRelogarAutomaticamente(unittest.TestCase):
+    """
+    _relogar_automaticamente() reenvia login+senha sem perguntar nada ao
+    usuário -- usada só pela reconexão automática, nunca no primeiro
+    login da sessão (que continua sendo realizar_login(), interativo).
+    """
+
+    def _resposta_serializada(self, tipo, **campos):
+        import protocolo
+        msg = {"tipo": tipo, **campos}
+        return protocolo.serializar(msg)
+
+    def test_login_ok_retorna_sucesso(self):
+        sock_mock = MagicMock()
+        sock_mock.recv.return_value = self._resposta_serializada(
+            "login_ok", nome="alice"
+        )
+        sucesso, buffer, motivo = cliente_app._relogar_automaticamente(
+            sock_mock, "alice", "senha123"
+        )
+        self.assertTrue(sucesso)
+        self.assertIsNone(motivo)
+        sock_mock.sendall.assert_called_once()
+
+    def test_login_erro_retorna_falha_com_motivo_do_servidor(self):
+        sock_mock = MagicMock()
+        sock_mock.recv.return_value = self._resposta_serializada(
+            "login_erro", motivo="senha incorreta"
+        )
+        sucesso, buffer, motivo = cliente_app._relogar_automaticamente(
+            sock_mock, "alice", "senha_errada"
+        )
+        self.assertFalse(sucesso)
+        self.assertEqual(motivo, "senha incorreta")
+
+    def test_timeout_na_resposta_retorna_falha(self):
+        import socket as socket_module
+        sock_mock = MagicMock()
+        sock_mock.recv.side_effect = socket_module.timeout()
+        sucesso, buffer, motivo = cliente_app._relogar_automaticamente(
+            sock_mock, "alice", "senha123"
+        )
+        self.assertFalse(sucesso)
+        self.assertIn("esgotado", motivo)
+
+    def test_conexao_cai_durante_reautenticacao_retorna_falha(self):
+        sock_mock = MagicMock()
+        sock_mock.recv.side_effect = ConnectionResetError()
+        sucesso, buffer, motivo = cliente_app._relogar_automaticamente(
+            sock_mock, "alice", "senha123"
+        )
+        self.assertFalse(sucesso)
+        self.assertIsNotNone(motivo)
+
+    def test_servidor_fecha_conexao_retorna_falha(self):
+        sock_mock = MagicMock()
+        sock_mock.recv.return_value = b""
+        sucesso, buffer, motivo = cliente_app._relogar_automaticamente(
+            sock_mock, "alice", "senha123"
+        )
+        self.assertFalse(sucesso)
+
+    def test_falha_ao_enviar_login_retorna_falha_sem_lancar(self):
+        sock_mock = MagicMock()
+        sock_mock.sendall.side_effect = BrokenPipeError()
+        sucesso, buffer, motivo = cliente_app._relogar_automaticamente(
+            sock_mock, "alice", "senha123"
+        )
+        self.assertFalse(sucesso)
+
+    def test_timeout_do_socket_e_removido_ao_final_mesmo_com_sucesso(self):
+        sock_mock = MagicMock()
+        sock_mock.recv.return_value = self._resposta_serializada(
+            "login_ok", nome="alice"
+        )
+        cliente_app._relogar_automaticamente(sock_mock, "alice", "senha123")
+        # ultima chamada a settimeout deve ser None (removendo o timeout)
+        self.assertEqual(sock_mock.settimeout.call_args_list[-1], call(None))
+
+
+class TestDormirInterrompivel(unittest.TestCase):
+    """_dormir_interrompivel() precisa esperar aproximadamente o tempo
+    pedido, mas retornar na hora se evento_encerrando for sinalizado no
+    meio -- essencial para /sair e Ctrl+C interromperem uma reconexão em
+    andamento sem demora."""
+
+    def test_espera_o_tempo_pedido_quando_nao_interrompido(self):
+        evento = threading.Event()
+        inicio = time.time()
+        cliente_app._dormir_interrompivel(0.3, evento)
+        decorrido = time.time() - inicio
+        self.assertGreaterEqual(decorrido, 0.28)
+        self.assertLess(decorrido, 0.6)
+
+    def test_retorna_cedo_se_evento_e_sinalizado_no_meio(self):
+        evento = threading.Event()
+
+        def sinalizar_logo():
+            time.sleep(0.1)
+            evento.set()
+
+        threading.Thread(target=sinalizar_logo, daemon=True).start()
+        inicio = time.time()
+        cliente_app._dormir_interrompivel(5.0, evento)
+        decorrido = time.time() - inicio
+        self.assertLess(decorrido, 1.0)
+
+    def test_retorna_imediatamente_se_evento_ja_setado(self):
+        evento = threading.Event()
+        evento.set()
+        inicio = time.time()
+        cliente_app._dormir_interrompivel(5.0, evento)
+        self.assertLess(time.time() - inicio, 0.5)
+
+
+class TestTentarReconectar(unittest.TestCase):
+    """
+    _tentar_reconectar() é o coração da funcionalidade: espera
+    exponencial, reautenticação automática, restauração de sala e
+    pedido de histórico. Os testes patcham as constantes de tempo para
+    valores minúsculos, para não deixar a suíte lenta.
+    """
+
+    def _estado_basico(self):
+        estado = cliente_app.EstadoCliente()
+        estado.ip = "192.0.2.1"
+        estado.porta = 5000
+        estado.nome = "alice"
+        estado.senha = "senha123"
+        estado.sala_atual = "geral"
+        return estado
+
+    def test_reconecta_na_primeira_tentativa(self):
+        estado = self._estado_basico()
+        evento = threading.Event()
+        sock_novo = MagicMock()
+
+        with patch("cliente_app.RECONEXAO_ESPERA_INICIAL_SEGUNDOS", 0.01), \
+             patch("cliente_app._dormir_interrompivel"), \
+             patch("cliente_app._tentar_conectar_uma_vez", return_value=(sock_novo, None)), \
+             patch("cliente_app._relogar_automaticamente", return_value=(True, b"sobra", None)):
+            sucesso, buffer = cliente_app._tentar_reconectar(estado, evento)
+
+        self.assertTrue(sucesso)
+        self.assertEqual(buffer, b"sobra")
+        self.assertIs(estado.sock, sock_novo)
+
+    def test_espera_dobra_a_cada_falha_ate_o_teto(self):
+        estado = self._estado_basico()
+        evento = threading.Event()
+        esperas_usadas = []
+
+        def registrar_espera(segundos, evento_encerrando):
+            esperas_usadas.append(segundos)
+
+        respostas = [(None, "falhou")] * 4 + [(MagicMock(), None)]
+
+        with patch("cliente_app.RECONEXAO_ESPERA_INICIAL_SEGUNDOS", 1.0), \
+             patch("cliente_app.RECONEXAO_ESPERA_MAXIMA_SEGUNDOS", 4.0), \
+             patch("cliente_app.RECONEXAO_DESISTIR_APOS_SEGUNDOS", 1000.0), \
+             patch("cliente_app._dormir_interrompivel", side_effect=registrar_espera), \
+             patch("cliente_app._tentar_conectar_uma_vez", side_effect=respostas), \
+             patch("cliente_app._relogar_automaticamente", return_value=(True, b"", None)):
+            sucesso, _ = cliente_app._tentar_reconectar(estado, evento)
+
+        self.assertTrue(sucesso)
+        # 1, 2, 4, 4, 4 -- dobra ate o teto de 4.0 e depois estabiliza
+        self.assertEqual(esperas_usadas, [1.0, 2.0, 4.0, 4.0, 4.0])
+
+    def test_desiste_apos_esgotar_tempo_total(self):
+        estado = self._estado_basico()
+        evento = threading.Event()
+
+        with patch("cliente_app.RECONEXAO_ESPERA_INICIAL_SEGUNDOS", 10.0), \
+             patch("cliente_app.RECONEXAO_ESPERA_MAXIMA_SEGUNDOS", 10.0), \
+             patch("cliente_app.RECONEXAO_DESISTIR_APOS_SEGUNDOS", 25.0), \
+             patch("cliente_app._dormir_interrompivel"), \
+             patch("cliente_app._tentar_conectar_uma_vez", return_value=(None, "sempre falha")):
+            sucesso, buffer = cliente_app._tentar_reconectar(estado, evento)
+
+        self.assertFalse(sucesso)
+        self.assertEqual(buffer, b"")
+        self.assertIsNone(estado.sock)  # nunca foi trocado, ja que nunca conectou
+
+    def test_cancela_se_evento_encerrando_e_setado_no_meio(self):
+        estado = self._estado_basico()
+        evento = threading.Event()
+
+        def dormir_e_cancelar(segundos, evento_encerrando):
+            evento_encerrando.set()
+
+        with patch("cliente_app.RECONEXAO_ESPERA_INICIAL_SEGUNDOS", 0.01), \
+             patch("cliente_app._dormir_interrompivel", side_effect=dormir_e_cancelar), \
+             patch("cliente_app._tentar_conectar_uma_vez") as mock_conectar:
+            sucesso, buffer = cliente_app._tentar_reconectar(estado, evento)
+
+        self.assertFalse(sucesso)
+        mock_conectar.assert_not_called()  # nem chegou a tentar -- cancelado antes
+
+    def test_desiste_se_reautenticacao_falhar(self):
+        """Nome pode ter sido tomado por outra pessoa enquanto a conexão
+        estava caída -- tentar de novo com o mesmo nome não resolveria,
+        então desiste em vez de ficar tentando para sempre."""
+        estado = self._estado_basico()
+        evento = threading.Event()
+        sock_novo = MagicMock()
+
+        with patch("cliente_app.RECONEXAO_ESPERA_INICIAL_SEGUNDOS", 0.01), \
+             patch("cliente_app._dormir_interrompivel"), \
+             patch("cliente_app._tentar_conectar_uma_vez", return_value=(sock_novo, None)), \
+             patch("cliente_app._relogar_automaticamente", return_value=(False, b"", "nome ja em uso")):
+            sucesso, buffer = cliente_app._tentar_reconectar(estado, evento)
+
+        self.assertFalse(sucesso)
+        sock_novo.close.assert_called_once()  # nao deve vazar o socket que conectou mas nao autenticou
+
+    def test_restaura_sala_diferente_de_geral_apos_reconectar(self):
+        estado = self._estado_basico()
+        estado.sala_atual = "jogos"
+        evento = threading.Event()
+        sock_novo = MagicMock()
+
+        with patch("cliente_app.RECONEXAO_ESPERA_INICIAL_SEGUNDOS", 0.01), \
+             patch("cliente_app._dormir_interrompivel"), \
+             patch("cliente_app._tentar_conectar_uma_vez", return_value=(sock_novo, None)), \
+             patch("cliente_app._relogar_automaticamente", return_value=(True, b"", None)):
+            cliente_app._tentar_reconectar(estado, evento)
+
+        import protocolo
+        chamadas = [c.args[0] for c in sock_novo.sendall.call_args_list]
+        mensagens_enviadas = []
+        for dados in chamadas:
+            msgs, _ = protocolo.extrair_mensagens(dados)
+            mensagens_enviadas.extend(msgs)
+        tipos = [m["tipo"] for m in mensagens_enviadas]
+        self.assertIn(protocolo.TIPO_ENTRAR_SALA, tipos)
+        entrar = next(m for m in mensagens_enviadas if m["tipo"] == protocolo.TIPO_ENTRAR_SALA)
+        self.assertEqual(entrar["sala"], "jogos")
+
+    def test_nao_tenta_reentrar_em_sala_se_ja_era_geral(self):
+        estado = self._estado_basico()
+        estado.sala_atual = "geral"
+        evento = threading.Event()
+        sock_novo = MagicMock()
+
+        with patch("cliente_app.RECONEXAO_ESPERA_INICIAL_SEGUNDOS", 0.01), \
+             patch("cliente_app._dormir_interrompivel"), \
+             patch("cliente_app._tentar_conectar_uma_vez", return_value=(sock_novo, None)), \
+             patch("cliente_app._relogar_automaticamente", return_value=(True, b"", None)):
+            cliente_app._tentar_reconectar(estado, evento)
+
+        import protocolo
+        chamadas = [c.args[0] for c in sock_novo.sendall.call_args_list]
+        mensagens_enviadas = []
+        for dados in chamadas:
+            msgs, _ = protocolo.extrair_mensagens(dados)
+            mensagens_enviadas.extend(msgs)
+        tipos = [m["tipo"] for m in mensagens_enviadas]
+        self.assertNotIn(protocolo.TIPO_ENTRAR_SALA, tipos)
+
+    def test_pede_historico_apos_reconectar(self):
+        estado = self._estado_basico()
+        evento = threading.Event()
+        sock_novo = MagicMock()
+
+        with patch("cliente_app.RECONEXAO_ESPERA_INICIAL_SEGUNDOS", 0.01), \
+             patch("cliente_app._dormir_interrompivel"), \
+             patch("cliente_app._tentar_conectar_uma_vez", return_value=(sock_novo, None)), \
+             patch("cliente_app._relogar_automaticamente", return_value=(True, b"", None)):
+            cliente_app._tentar_reconectar(estado, evento)
+
+        import protocolo
+        chamadas = [c.args[0] for c in sock_novo.sendall.call_args_list]
+        mensagens_enviadas = []
+        for dados in chamadas:
+            msgs, _ = protocolo.extrair_mensagens(dados)
+            mensagens_enviadas.extend(msgs)
+        tipos = [m["tipo"] for m in mensagens_enviadas]
+        self.assertIn(protocolo.TIPO_HISTORICO, tipos)
+
+
+class TestReceberAteCair(unittest.TestCase):
+    """_receber_ate_cair() nunca deve encerrar o processo -- sempre
+    retorna normalmente, deixando a decisão de reconectar (ou não) para
+    quem chamou (supervisionar_conexao)."""
+
+    def test_retorna_normalmente_quando_conexao_cai(self):
+        sock_mock = MagicMock()
+        sock_mock.recv.side_effect = ConnectionResetError()
+        evento = threading.Event()
+        estado = cliente_app.EstadoCliente()
+        # nao deve levantar excecao nem chamar os._exit
+        cliente_app._receber_ate_cair(sock_mock, b"", evento, estado)
+        self.assertFalse(evento.is_set())  # nao seta o evento sozinho
+
+    def test_retorna_normalmente_quando_servidor_fecha(self):
+        sock_mock = MagicMock()
+        sock_mock.recv.return_value = b""
+        evento = threading.Event()
+        estado = cliente_app.EstadoCliente()
+        cliente_app._receber_ate_cair(sock_mock, b"", evento, estado)
+        self.assertFalse(evento.is_set())
+
+    def test_retorna_quando_evento_encerrando_e_sinalizado_por_fora(self):
+        sock_mock = MagicMock()
+        evento = threading.Event()
+        evento.set()
+        estado = cliente_app.EstadoCliente()
+        # com o evento ja setado, nem deveria tentar recv()
+        cliente_app._receber_ate_cair(sock_mock, b"", evento, estado)
+        sock_mock.recv.assert_not_called()
+
+
+class TestSupervisionarConexaoIntegracao(unittest.TestCase):
+    """
+    Testa supervisionar_conexao() de ponta a ponta (com mocks),
+    confirmando que ela: (a) não tenta reconectar quando a saída foi
+    pedida pelo usuário; (b) reconecta e continua operando quando a
+    queda foi inesperada; (c) encerra o processo quando a reconexão
+    desiste de vez.
+    """
+
+    def test_nao_reconecta_se_usuario_pediu_saida(self):
+        estado = cliente_app.EstadoCliente()
+        estado.sock = MagicMock()
+        evento = threading.Event()
+
+        def receber_e_sair(sock, buffer, evento_encerrando, estado_):
+            evento_encerrando.set()  # simula /sair fechando a conexao
+
+        with patch("cliente_app._receber_ate_cair", side_effect=receber_e_sair), \
+             patch("cliente_app._tentar_reconectar") as mock_reconectar:
+            cliente_app.supervisionar_conexao(estado, evento, b"")
+
+        mock_reconectar.assert_not_called()
+
+    def test_reconecta_e_volta_a_receber_apos_queda_inesperada(self):
+        estado = cliente_app.EstadoCliente()
+        estado.sock = MagicMock()
+        evento = threading.Event()
+        chamadas_receber = []
+
+        def receber(sock, buffer, evento_encerrando, estado_):
+            chamadas_receber.append(sock)
+            if len(chamadas_receber) >= 2:
+                evento_encerrando.set()  # encerra no segundo ciclo p/ nao rodar pra sempre
+
+        sock_novo = MagicMock()
+
+        with patch("cliente_app._receber_ate_cair", side_effect=receber), \
+             patch("cliente_app._tentar_reconectar", return_value=(True, b"")) as mock_reconectar:
+            cliente_app.supervisionar_conexao(estado, evento, b"")
+
+        mock_reconectar.assert_called_once()
+        self.assertEqual(len(chamadas_receber), 2)
+
+    def test_encerra_processo_quando_reconexao_desiste(self):
+        estado = cliente_app.EstadoCliente()
+        estado.sock = MagicMock()
+        evento = threading.Event()
+
+        with patch("cliente_app._receber_ate_cair"), \
+             patch("cliente_app._tentar_reconectar", return_value=(False, b"")), \
+             patch("cliente_app._encerrar_processo_final") as mock_exit:
+            cliente_app.supervisionar_conexao(estado, evento, b"")
+
+        mock_exit.assert_called_once()
+        self.assertTrue(evento.is_set())
+
+    def test_nao_encerra_processo_a_forca_se_usuario_cancelou_durante_reconexao(self):
+        """Regressão: se o usuário mandou /sair ou Ctrl+C bem no meio de
+        uma tentativa de reconexão, _tentar_reconectar retorna False
+        (cancelado) com evento_encerrando JÁ setado -- isso não é uma
+        desistência de verdade, e não deve forçar os._exit(); o
+        encerramento normal (via main()/encerrar()) já está em curso."""
+        estado = cliente_app.EstadoCliente()
+        estado.sock = MagicMock()
+        evento = threading.Event()
+
+        def reconectar_cancelado(estado_, evento_encerrando):
+            evento_encerrando.set()  # simula o /sair setando o evento
+            return False, b""
+
+        with patch("cliente_app._receber_ate_cair"), \
+             patch("cliente_app._tentar_reconectar", side_effect=reconectar_cancelado), \
+             patch("cliente_app._encerrar_processo_final") as mock_exit:
+            cliente_app.supervisionar_conexao(estado, evento, b"")
+
+        mock_exit.assert_not_called()
+
+
+class TestEncerrarUsaSocketAtual(unittest.TestCase):
+    """encerrar() precisa fechar o socket ATUAL guardado em estado
+    (não um socket antigo capturado no início da sessão), já que uma
+    reconexão pode ter trocado o socket no meio da sessão."""
+
+    def test_fecha_o_socket_guardado_em_estado(self):
+        estado = cliente_app.EstadoCliente()
+        sock_atual = MagicMock()
+        estado.sock = sock_atual
+        evento = threading.Event()
+
+        cliente_app.encerrar(estado, evento)
+
+        sock_atual.close.assert_called_once()
+        self.assertTrue(evento.is_set())
+
+    def test_seta_evento_antes_de_fechar_para_supervisor_nao_tentar_reconectar(self):
+        estado = cliente_app.EstadoCliente()
+        estado.sock = MagicMock()
+        evento = threading.Event()
+        ordem = []
+        evento_set_original = evento.set
+        estado.sock.close.side_effect = lambda: ordem.append("close")
+        with patch.object(evento, "set", side_effect=lambda: (ordem.append("set"), evento_set_original())):
+            cliente_app.encerrar(estado, evento)
+        self.assertEqual(ordem, ["set", "close"])
 
 
 if __name__ == "__main__":

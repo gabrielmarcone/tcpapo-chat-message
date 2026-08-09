@@ -27,6 +27,8 @@ pequeno perto do que já é validado com testes de integração reais
 import contextlib
 import io
 import os
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -1059,6 +1061,206 @@ class TestEncerrarUsaSocketAtual(unittest.TestCase):
         with patch.object(evento, "set", side_effect=lambda: (ordem.append("set"), evento_set_original())):
             cliente_app.encerrar(estado, evento)
         self.assertEqual(ordem, ["set", "close"])
+
+
+# ==============================================================================
+# Descoberta automática de servidor (UDP)
+# ==============================================================================
+
+class TestDescobrirServidor(unittest.TestCase):
+    """
+    descobrir_servidor() nunca deve levantar exceção por falta de
+    resposta -- lista vazia é um resultado esperado e válido (rede sem
+    servidor algum rodando, ou broadcast bloqueado pela rede).
+    """
+
+    def _resposta_servidor_aqui(self, porta_tcp):
+        return protocolo.serializar(protocolo.msg_servidor_aqui(porta_tcp))
+
+    def _com_timeout_perpetuo_apos(self, respostas):
+        """
+        O laço real de descobrir_servidor() chama recvfrom() em loop até
+        o tempo de espera todo passar -- um side_effect com lista fixa
+        se esgota e levanta StopIteration. Este helper devolve as
+        respostas combinadas, em ordem, e a partir daí passa a levantar
+        socket.timeout() para sempre, imitando "não chegou mais nada
+        pelo resto da espera".
+        """
+        fila = list(respostas)
+
+        def _proxima(*args, **kwargs):
+            if fila:
+                return fila.pop(0)
+            raise socket.timeout()
+
+        return _proxima
+
+    def test_nenhuma_resposta_devolve_lista_vazia(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = socket.timeout()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            resultado = cliente_app.descobrir_servidor(5001, tempo_espera=0.3)
+        self.assertEqual(resultado, [])
+
+    def test_habilita_broadcast_no_socket(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = socket.timeout()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            cliente_app.descobrir_servidor(5001, tempo_espera=0.1)
+        sock_mock.setsockopt.assert_any_call(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+    def test_envia_para_endereco_de_broadcast_limitado(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = socket.timeout()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            cliente_app.descobrir_servidor(5001, tempo_espera=0.1)
+        (dados, endereco), _ = sock_mock.sendto.call_args
+        self.assertEqual(endereco, ("255.255.255.255", 5001))
+        mensagens, _ = protocolo.extrair_mensagens(dados)
+        self.assertEqual(mensagens[0]["tipo"], protocolo.TIPO_DESCOBRIR_SERVIDOR)
+
+    def test_uma_resposta_valida_e_encontrada(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = self._com_timeout_perpetuo_apos([
+            (self._resposta_servidor_aqui(5000), ("192.168.1.10", 54321)),
+        ])
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            resultado = cliente_app.descobrir_servidor(5001, tempo_espera=0.3)
+        self.assertEqual(resultado, [("192.168.1.10", 5000)])
+
+    def test_multiplas_respostas_distintas_sao_todas_encontradas(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = self._com_timeout_perpetuo_apos([
+            (self._resposta_servidor_aqui(5000), ("192.168.1.10", 1)),
+            (self._resposta_servidor_aqui(6000), ("192.168.1.20", 1)),
+        ])
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            resultado = cliente_app.descobrir_servidor(5001, tempo_espera=0.3)
+        self.assertEqual(set(resultado), {("192.168.1.10", 5000), ("192.168.1.20", 6000)})
+
+    def test_resposta_duplicada_do_mesmo_servidor_nao_repete_na_lista(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = self._com_timeout_perpetuo_apos([
+            (self._resposta_servidor_aqui(5000), ("192.168.1.10", 1)),
+            (self._resposta_servidor_aqui(5000), ("192.168.1.10", 1)),
+        ])
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            resultado = cliente_app.descobrir_servidor(5001, tempo_espera=0.3)
+        self.assertEqual(resultado, [("192.168.1.10", 5000)])
+
+    def test_ignora_datagrama_malformado(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = self._com_timeout_perpetuo_apos([
+            (b"lixo nao json\n", ("192.168.1.99", 1)),
+            (self._resposta_servidor_aqui(5000), ("192.168.1.10", 1)),
+        ])
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            resultado = cliente_app.descobrir_servidor(5001, tempo_espera=0.3)
+        self.assertEqual(resultado, [("192.168.1.10", 5000)])
+
+    def test_ignora_mensagem_de_tipo_diferente(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = self._com_timeout_perpetuo_apos([
+            (protocolo.serializar(protocolo.msg_login_ok("alice")), ("192.168.1.10", 1)),
+        ])
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            resultado = cliente_app.descobrir_servidor(5001, tempo_espera=0.3)
+        self.assertEqual(resultado, [])
+
+    def test_falha_ao_enviar_broadcast_nao_lanca_excecao(self):
+        sock_mock = MagicMock()
+        sock_mock.sendto.side_effect = OSError("rede indisponível")
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            resultado = cliente_app.descobrir_servidor(5001, tempo_espera=0.3)
+        self.assertEqual(resultado, [])
+        sock_mock.close.assert_called_once()
+
+    def test_fecha_o_socket_ao_final(self):
+        sock_mock = MagicMock()
+        sock_mock.recvfrom.side_effect = socket.timeout()
+        with patch("cliente_app.socket.socket", return_value=sock_mock):
+            cliente_app.descobrir_servidor(5001, tempo_espera=0.1)
+        sock_mock.close.assert_called_once()
+
+
+class TestEscolherServidorDescoberto(unittest.TestCase):
+    def test_nenhum_encontrado_encerra_com_dica_de_ip_manual(self):
+        with contextlib.redirect_stdout(io.StringIO()) as saida:
+            with self.assertRaises(SystemExit) as contexto:
+                cliente_app.escolher_servidor_descoberto([])
+        self.assertEqual(contexto.exception.code, 1)
+        self.assertIn("--ip", saida.getvalue())
+
+    def test_um_encontrado_e_usado_direto_sem_perguntar(self):
+        with patch("builtins.input") as mock_input:
+            resultado = cliente_app.escolher_servidor_descoberto([("192.168.1.10", 5000)])
+        self.assertEqual(resultado, ("192.168.1.10", 5000))
+        mock_input.assert_not_called()
+
+    def test_multiplos_encontrados_pede_escolha_e_usa_a_correta(self):
+        encontrados = [("192.168.1.10", 5000), ("192.168.1.20", 6000)]
+        with patch("builtins.input", return_value="2"):
+            resultado = cliente_app.escolher_servidor_descoberto(encontrados)
+        self.assertEqual(resultado, ("192.168.1.20", 6000))
+
+    def test_entrada_invalida_pede_de_novo_ate_ser_valida(self):
+        encontrados = [("192.168.1.10", 5000), ("192.168.1.20", 6000)]
+        respostas = iter(["abc", "99", "1"])
+        with patch("builtins.input", side_effect=lambda *_: next(respostas)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                resultado = cliente_app.escolher_servidor_descoberto(encontrados)
+        self.assertEqual(resultado, ("192.168.1.10", 5000))
+
+    def test_ctrl_c_durante_escolha_encerra_com_saida_limpa(self):
+        encontrados = [("192.168.1.10", 5000), ("192.168.1.20", 6000)]
+        with patch("builtins.input", side_effect=KeyboardInterrupt()):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as contexto:
+                    cliente_app.escolher_servidor_descoberto(encontrados)
+        self.assertEqual(contexto.exception.code, 0)
+
+
+class TestArgparseIpOuDescobrir(unittest.TestCase):
+    """
+    Testes de contrato via subprocess real: --ip e --descobrir precisam
+    ser mutuamente exclusivos, e pelo menos um dos dois é obrigatório --
+    testado invocando o programa de verdade, já que é o argparse (nível
+    de linha de comando) que impõe essa regra, antes de qualquer lógica
+    da aplicação rodar.
+    """
+
+    def _rodar(self, args_extras):
+        return subprocess.run(
+            [sys.executable, "cliente_app.py", *args_extras],
+            capture_output=True, text=True, timeout=5,
+        )
+
+    def test_nenhum_dos_dois_e_erro(self):
+        resultado = self._rodar([])
+        self.assertNotEqual(resultado.returncode, 0)
+        self.assertIn("required", resultado.stderr.lower())
+
+    def test_ambos_ao_mesmo_tempo_e_erro(self):
+        resultado = self._rodar(["--ip", "192.168.1.10", "--descobrir"])
+        self.assertNotEqual(resultado.returncode, 0)
+        self.assertIn("not allowed", resultado.stderr.lower())
+
+    def test_so_descobrir_passa_da_fase_de_argparse(self):
+        """
+        Não faz sentido validar a descoberta completa aqui (exigiria
+        rede de verdade) -- só confirma que --descobrir sozinho não é
+        rejeitado pelo argparse (a diferença de comportamento depois
+        disso já é coberta por TestDescobrirServidor e
+        TestEscolherServidorDescoberto).
+        """
+        resultado = subprocess.run(
+            [sys.executable, "cliente_app.py", "--descobrir", "--porta-descoberta", "1"],
+            capture_output=True, text=True, timeout=8,
+        )
+        # a peculiaridade aqui e' que sem servidor nenhum respondendo,
+        # o programa deve terminar sozinho (erro de descoberta), nao
+        # ficar preso -- e o erro nao pode ser do argparse
+        self.assertNotIn("usage:", resultado.stderr.lower())
 
 
 if __name__ == "__main__":

@@ -669,6 +669,96 @@ def loop_accept(
         thread.start()
 
 
+# --------------------------------------------------------------------------
+# Descoberta automática de servidor (UDP)
+# --------------------------------------------------------------------------
+# Recurso adicional, independente do chat em si: um socket UDP à parte,
+# numa porta própria, só para responder "estou aqui, minha porta TCP é
+# X" a quem perguntar via broadcast na rede local (ver
+# cliente_app.py:descobrir_servidor). Uma falha aqui — porta de
+# descoberta já em uso por outro processo, por exemplo — nunca deve
+# impedir o chat TCP de funcionar normalmente: é por isso que
+# criar_socket_descoberta() devolve None em vez de levantar exceção, e
+# main() decide continuar sem a descoberta nesse caso, em vez de
+# encerrar o servidor inteiro por causa de um recurso opcional.
+
+def criar_socket_descoberta(porta: int) -> Optional[socket.socket]:
+    """
+    Cria e faz bind do socket UDP usado só para responder a pedidos de
+    descoberta automática. Devolve None (em vez de levantar exceção) se
+    não conseguir — quem chama decide como avisar sobre isso, sem que
+    uma falha aqui derrube o servidor inteiro, já que a descoberta é um
+    recurso adicional, não algo do qual o chat em si dependa.
+
+    De propósito, SEM SO_REUSEADDR aqui — diferente do socket TCP
+    principal (ver criar_socket_servidor). Em UDP, SO_REUSEADDR no
+    Linux tem uma semântica bem mais permissiva do que em TCP: em vez
+    de só permitir reaproveitar uma porta presa em TIME_WAIT (que nem
+    existe para UDP, protocolo sem conexão), ele permite que DOIS
+    processos façam bind na MESMA porta UDP ao mesmo tempo, sem erro
+    nenhum — cada datagrama que chegar depois disso vai
+    imprevisivelmente para um processo ou para o outro. Isso é
+    exatamente o oposto do que a descoberta precisa: se a porta já
+    estiver em uso por outra instância do servidor, o bind PRECISA
+    falhar de verdade, para que esta instância perceba o conflito e
+    desative a própria descoberta com um aviso claro (ver main()), em
+    vez de os dois servidores competirem silenciosamente pelas mesmas
+    respostas.
+
+    Mesmo timeout de criar_socket_servidor() e pelo mesmo motivo: faz
+    recvfrom() retornar periodicamente mesmo sem nenhum pedido chegando,
+    para que o encerramento do servidor (fechando este socket por fora)
+    seja percebido rápido por loop_descoberta().
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((HOST_PADRAO, porta))
+        sock.settimeout(TIMEOUT_ACCEPT_SEGUNDOS)
+        return sock
+    except OSError:
+        return None
+
+
+def loop_descoberta(socket_descoberta: socket.socket, porta_tcp: int) -> None:
+    """
+    Roda em thread própria, durante toda a vida do servidor. Fica
+    esperando datagramas UDP; para cada um que for um pedido de
+    descoberta reconhecido (protocolo.TIPO_DESCOBRIR_SERVIDOR), responde
+    diretamente (unicast, nunca por broadcast) para quem perguntou, com
+    a porta TCP em que o chat de verdade está escutando.
+
+    Qualquer datagrama que não seja um pedido de descoberta válido —
+    lixo, pacote malformado, tráfego de outro protocolo batendo na
+    mesma porta por coincidência — é simplesmente ignorado: este socket
+    nunca deve derrubar o servidor por causa de um dado inesperado
+    vindo de UDP, protocolo que não garante nada sobre quem manda o quê.
+
+    Retorna quando socket_descoberta é fechado por fora (encerramento
+    do servidor), no mesmo padrão de loop_accept().
+    """
+    while True:
+        try:
+            dados, endereco = socket_descoberta.recvfrom(4096)
+        except socket.timeout:
+            continue  # só um "despertar" periódico — nada de errado aconteceu
+        except OSError:
+            return  # socket_descoberta foi fechado — encerramento normal
+
+        try:
+            mensagens, _ = protocolo.extrair_mensagens(dados)
+        except protocolo.ErroProtocolo:
+            continue  # datagrama não reconhecido — ignora, sem derrubar nada
+
+        for msg in mensagens:
+            if msg.get("tipo") != protocolo.TIPO_DESCOBRIR_SERVIDOR:
+                continue  # tipo de mensagem que não esperamos aqui — ignora
+            try:
+                resposta = protocolo.serializar(protocolo.msg_servidor_aqui(porta_tcp))
+                socket_descoberta.sendto(resposta, endereco)
+            except OSError:
+                continue  # falha pontual ao responder — não é motivo para parar de escutar
+
+
 def _resolver_caminho_banco(banco_explicito: Optional[str], porta_real: int) -> str:
     """
     Decide o caminho do arquivo SQLite do histórico de mensagens.
@@ -714,6 +804,20 @@ def main() -> None:
         default=CAMINHO_BANCO_USUARIOS_PADRAO,
         help=f"Arquivo SQLite para o cadastro de usuarios (padrao: {CAMINHO_BANCO_USUARIOS_PADRAO})",
     )
+    parser.add_argument(
+        "--porta-descoberta",
+        type=int,
+        default=protocolo.PORTA_DESCOBERTA_PADRAO,
+        help=(
+            "Porta UDP para responder a pedidos de descoberta automática "
+            f"de servidor (padrao: {protocolo.PORTA_DESCOBERTA_PADRAO})"
+        ),
+    )
+    parser.add_argument(
+        "--sem-descoberta",
+        action="store_true",
+        help="Desativa a descoberta automática via UDP (o chat TCP continua funcionando normalmente)",
+    )
     args = parser.parse_args()
 
     registro = RegistroClientes()
@@ -742,12 +846,43 @@ def main() -> None:
 
     print(f"{_prefixo_hora()} {_c('Servidor escutando em', _Cor.VERDE)} {HOST_PADRAO}:{porta_real} (Ctrl+C para encerrar)")
 
+    # Descoberta automática: recurso adicional, nunca essencial — uma
+    # falha aqui (porta já em uso, tipicamente) só desativa a descoberta
+    # para esta instância, sem impedir o chat TCP de funcionar
+    # normalmente. --sem-descoberta permite desligar de propósito (por
+    # exemplo, ao rodar várias instâncias na mesma máquina para teste,
+    # onde só uma delas conseguiria a porta de descoberta de qualquer
+    # forma).
+    socket_descoberta: Optional[socket.socket] = None
+    thread_descoberta: Optional[threading.Thread] = None
+    if not args.sem_descoberta:
+        socket_descoberta = criar_socket_descoberta(args.porta_descoberta)
+        if socket_descoberta is not None:
+            print(
+                f"{_prefixo_hora()} {_c('Descoberta automatica ativa em', _Cor.VERDE)} "
+                f"UDP {args.porta_descoberta} (clientes podem usar --descobrir)"
+            )
+            thread_descoberta = threading.Thread(
+                target=loop_descoberta,
+                args=(socket_descoberta, porta_real),
+                daemon=True,
+            )
+            thread_descoberta.start()
+        else:
+            print(
+                f"{_c('[aviso]', _Cor.AMARELO)} não foi possível iniciar a descoberta automática "
+                f"na porta UDP {args.porta_descoberta} (já em uso?) — o chat continua "
+                f"funcionando normalmente, mas clientes precisarão usar --ip manualmente."
+            )
+
     try:
         loop_accept(socket_servidor, registro, historico, usuarios)
     except KeyboardInterrupt:
         print(f"\n{_c('Encerrando servidor...', _Cor.AMARELO)}")
     finally:
         socket_servidor.close()
+        if socket_descoberta is not None:
+            socket_descoberta.close()
         historico.fechar()
         usuarios.fechar()
 

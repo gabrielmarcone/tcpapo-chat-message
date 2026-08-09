@@ -36,6 +36,16 @@ from typing import Any, Optional
 
 ENCODING = "utf-8"
 
+# Porta UDP padrão usada pela descoberta automática de servidor (ver
+# TIPO_DESCOBRIR_SERVIDOR / TIPO_SERVIDOR_AQUI mais abaixo). Fica aqui,
+# não em servidor.py nem cliente_app.py, porque — diferente da porta
+# TCP do chat, que cada lado escolhe livremente e nem precisa combinar
+# com antecedência — o valor da porta de descoberta é, por natureza,
+# um acordo de protocolo: os dois lados só se encontram se concordarem
+# de antemão em qual porta procurar, então faz sentido ela morar junto
+# com o resto do vocabulário compartilhado.
+PORTA_DESCOBERTA_PADRAO = 5001
+
 
 class ErroProtocolo(Exception):
     """
@@ -88,6 +98,17 @@ TIPO_LISTA_USUARIOS = "lista_usuarios"
 TIPO_NOTIFICACAO = "notificacao"
 TIPO_ERRO = "erro"
 TIPO_HISTORICO_RESPOSTA = "historico_resposta"
+
+# Descoberta automática de servidor — via UDP, nunca pela conexão TCP
+# do chat em si (que exige já saber o endereço de antemão). Mensagens
+# soltas, sem relação de sessão/login com o resto do protocolo: cada
+# datagrama UDP já é uma mensagem completa por si só, sem precisar do
+# framing por "\n" que o fluxo contínuo do TCP exige — ainda assim,
+# reaproveitam serializar()/extrair_mensagens() normalmente, já que um
+# único datagrama satisfaz sozinho o formato "uma linha JSON terminada
+# em \n" que essas funções esperam.
+TIPO_DESCOBRIR_SERVIDOR = "descobrir_servidor"  # Cliente -> Servidor (broadcast)
+TIPO_SERVIDOR_AQUI = "servidor_aqui"  # Servidor -> Cliente (resposta direta)
 
 # TIPO_MENSAGEM_GERAL e TIPO_MENSAGEM_PRIVADA são reaproveitados nos dois
 # sentidos — o que muda é o conjunto de campos presentes, não o nome do
@@ -314,3 +335,30 @@ def msg_historico_resposta(sala: str, mensagens: list) -> dict:
 
 def msg_erro(motivo: str) -> dict:
     return {"tipo": TIPO_ERRO, "motivo": motivo}
+
+
+# --- Descoberta automática de servidor (UDP) ---
+
+def msg_descobrir_servidor() -> dict:
+    """
+    Cliente -> Servidor, enviada por UDP broadcast (nunca por TCP).
+    Pede que qualquer servidor do tcpapo-chat-message escutando na
+    rede local se identifique. Não carrega nenhum campo além do tipo —
+    não há nada que o cliente precise informar para perguntar "quem
+    está aí?".
+    """
+    return {"tipo": TIPO_DESCOBRIR_SERVIDOR}
+
+
+def msg_servidor_aqui(porta_tcp: int) -> dict:
+    """
+    Servidor -> Cliente, resposta direta (unicast) a um pedido de
+    descoberta — nunca também por broadcast, já que só quem perguntou
+    precisa saber a resposta.
+
+    Carrega só a porta TCP do chat de verdade. O IP do servidor não
+    entra no corpo da mensagem porque o cliente já o descobre de graça,
+    pelo endereço de origem do datagrama UDP recebido (ver
+    socket.recvfrom(), que devolve (dados, (ip_origem, porta_origem))).
+    """
+    return {"tipo": TIPO_SERVIDOR_AQUI, "porta_tcp": porta_tcp}

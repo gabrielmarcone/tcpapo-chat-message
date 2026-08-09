@@ -7,6 +7,11 @@ Responsabilidade:
       nova tentativa de nome/senha em caso de erro.
     - Concorrência: thread dedicada exclusivamente à recepção (recv +
       desserializa + imprime); a thread principal só lê input() e envia.
+    - Reconexão automática: se a conexão cair de forma inesperada (não
+      solicitada pelo usuário), tenta reconectar sozinho, com espera
+      exponencial entre tentativas, reautenticando com as mesmas
+      credenciais e restaurando a sala em que o usuário estava (ver
+      supervisionar_conexao() e _tentar_reconectar()).
     - Parsing de comandos digitados pelo usuário (texto comum, /priv,
       /lista, /entrar, /sair_sala, /historico, /sair), isolado em
       parse_comando() para não espalhar ifs pelo main().
@@ -25,6 +30,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from datetime import datetime
 from getpass import getpass
 from typing import Optional, Tuple
@@ -166,6 +172,24 @@ def _info(texto: str) -> None:
 # inatividade na conversa.
 TIMEOUT_CONEXAO = 5.0  # segundos
 
+# --------------------------------------------------------------------------
+# Reconexão automática
+# --------------------------------------------------------------------------
+# Estratégia: espera exponencial entre tentativas (backoff), o mesmo
+# princípio usado pelo próprio TCP para retransmissão e por praticamente
+# todo cliente de rede real (apps de chat, dispositivos IoT, etc.) —
+# começa com uma espera curta e vai dobrando a cada tentativa malsucedida,
+# até um teto máximo, em vez de martelar o servidor em intervalos fixos
+# ou desistir de imediato. Depois de um tempo total gasto sem sucesso,
+# desiste de vez: continuar tentando para sempre, sem nenhum limite, não
+# é realista nem desejável — se o servidor não voltou em alguns minutos,
+# o mais provável é que o problema exija intervenção manual (reconfigurar
+# rede, reiniciar o cliente com outro endereço, etc.), não mais uma
+# tentativa automática.
+RECONEXAO_ESPERA_INICIAL_SEGUNDOS = 2.0
+RECONEXAO_ESPERA_MAXIMA_SEGUNDOS = 30.0
+RECONEXAO_DESISTIR_APOS_SEGUNDOS = 300.0  # 5 minutos de tentativas seguidas
+
 
 # --------------------------------------------------------------------------
 # Validação de argumentos de linha de comando
@@ -195,49 +219,67 @@ def validar_porta(valor: str) -> int:
 # Conexão
 # --------------------------------------------------------------------------
 
-def conectar(ip: str, porta: int) -> socket.socket:
+def _tentar_conectar_uma_vez(ip: str, porta: int) -> Tuple[Optional[socket.socket], Optional[str]]:
     """
-    Cria um socket TCP e conecta a (ip, porta).
+    Uma única tentativa de conexão TCP, sem decidir nada sobre encerrar
+    o programa — devolve (socket, None) em caso de sucesso, ou
+    (None, motivo_do_erro) em caso de falha, sempre fechando o socket
+    antes de devolver None.
 
-    Trata os erros de conexão mais comuns de forma organizada, com
-    mensagem amigável para o usuário, e encerra o programa se a conexão
-    não puder ser estabelecida (sem conexão, não há mais nada a fazer).
-
-    sock.settimeout(TIMEOUT_CONEXAO) é aplicado antes do connect(): sem
-    um timeout explícito, uma tentativa de conexão a um IP que existe na
-    rede mas não responde (ex: firewall descartando o pacote
-    silenciosamente, em vez de recusar a conexão) ficaria travada
-    indefinidamente em vez de falhar com uma mensagem clara. Depois de
-    conectar com sucesso, o timeout é removido (settimeout(None)) para
-    não afetar o recv() bloqueante usado pelo resto da aplicação.
+    Fatorado à parte de conectar() para ser reaproveitado também pela
+    reconexão automática (_tentar_reconectar()), que precisa tentar
+    repetidas vezes sem que uma falha isolada encerre o processo — só
+    conectar() (usada na primeira conexão da sessão) decide encerrar o
+    programa se falhar.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(TIMEOUT_CONEXAO)
     try:
         sock.connect((ip, porta))
     except ConnectionRefusedError:
-        _erro(f"conexão recusada por {ip}:{porta} (servidor não está escutando aí?)")
         sock.close()
-        sys.exit(1)
+        return None, f"conexão recusada por {ip}:{porta} (servidor não está escutando aí?)"
     except socket.gaierror:
-        _erro(f"não foi possível resolver o endereço '{ip}' (IP ou host inválido).")
         sock.close()
-        sys.exit(1)
+        return None, f"não foi possível resolver o endereço '{ip}' (IP ou host inválido)."
     except socket.timeout:
-        _erro(f"tempo esgotado ({TIMEOUT_CONEXAO:.0f}s) ao conectar a {ip}:{porta} "
-              f"— servidor indisponível ou inacessível na rede.")
         sock.close()
-        sys.exit(1)
+        return None, (
+            f"tempo esgotado ({TIMEOUT_CONEXAO:.0f}s) ao conectar a {ip}:{porta} "
+            f"— servidor indisponível ou inacessível na rede."
+        )
     except KeyboardInterrupt:
-        _info("conexão cancelada pelo usuário.")
         sock.close()
-        sys.exit(0)
+        raise
     except OSError as erro:
-        _erro(f"falha de rede ao conectar a {ip}:{porta} ({erro}).")
         sock.close()
-        sys.exit(1)
+        return None, f"falha de rede ao conectar a {ip}:{porta} ({erro})."
 
     sock.settimeout(None)
+    return sock, None
+
+
+def conectar(ip: str, porta: int) -> socket.socket:
+    """
+    Cria um socket TCP e conecta a (ip, porta), encerrando o programa
+    com mensagem amigável se a primeira conexão da sessão falhar (sem
+    conexão nenhuma, não há mais nada a fazer nesse momento).
+
+    KeyboardInterrupt é tratado explicitamente porque a tentativa de
+    connect() fica bloqueada por até TIMEOUT_CONEXAO segundos — sem
+    isso, um Ctrl+C durante essa espera subiria como traceback em vez
+    de um encerramento limpo.
+    """
+    try:
+        sock, motivo = _tentar_conectar_uma_vez(ip, porta)
+    except KeyboardInterrupt:
+        _info("conexão cancelada pelo usuário.")
+        sys.exit(0)
+
+    if sock is None:
+        _erro(motivo)
+        sys.exit(1)
+
     _ok(f"conectado a {ip}:{porta}")
     return sock
 
@@ -252,26 +294,46 @@ def conectar(ip: str, porta: int) -> socket.socket:
 class EstadoCliente:
     """
     Estado local do cliente, compartilhado entre a thread principal (que
-    envia comandos) e a thread de recepção (que exibe mensagens). Hoje
-    guarda só a sala atual.
+    envia comandos) e a thread de recepção/reconexão (que exibe
+    mensagens e, se necessário, reconecta sozinha).
 
-    Necessário porque o protocolo não inclui o nome da sala na mensagem
-    mensagem_geral — o servidor decide o escopo do broadcast a partir do
-    estado interno dele, sem expor isso no dado da mensagem — então, sem
-    rastrear isso aqui, o cliente não teria como saber de qual sala veio
-    uma mensagem geral recebida, e sempre mostraria "[geral]" mesmo
-    depois de /entrar em outra sala.
-
-    Atualizado de forma otimista em main(), logo após enviar /entrar ou
-    /sair_sala com sucesso — sem esperar confirmação do servidor. Isso é
-    seguro porque o servidor sempre aceita esses comandos quando o campo
-    já foi validado no cliente (a única exceção — pedir para entrar na
-    sala em que já está — ainda deixa o cliente na mesma sala, então a
+    sala_atual: necessário porque o protocolo não inclui o nome da sala
+    na mensagem mensagem_geral — o servidor decide o escopo do broadcast
+    a partir do estado interno dele, sem expor isso no dado da mensagem
+    — então, sem rastrear isso aqui, o cliente não teria como saber de
+    qual sala veio uma mensagem geral recebida, e sempre mostraria
+    "[geral]" mesmo depois de /entrar em outra sala. Atualizado de forma
+    otimista em main(), logo após enviar /entrar ou /sair_sala com
+    sucesso — sem esperar confirmação do servidor. Isso é seguro porque
+    o servidor sempre aceita esses comandos quando o campo já foi
+    validado no cliente (a única exceção — pedir para entrar na sala em
+    que já está — ainda deixa o cliente na mesma sala, então a
     atualização otimista continua correta nesse caso também).
+
+    ip / porta / nome / senha: preenchidos por main() logo após o login
+    inicial, e usados só pela reconexão automática (_tentar_reconectar)
+    para saber para onde reconectar e com quais credenciais reautenticar
+    sozinha, sem precisar perguntar nada ao usuário de novo. A senha
+    fica em memória — nunca é gravada em disco nem logada — pelo tempo
+    de vida do processo; é o mesmo tipo de trade-off que qualquer
+    aplicativo com "continuar conectado" faz, aqui limitado à duração de
+    uma única sessão.
+
+    sock / lock: o socket ativo agora, e um lock que protege a troca
+    dele. A thread principal (main()) sempre lê estado.sock sob o lock,
+    logo antes de cada envio — nunca guarda uma cópia da referência por
+    muito tempo — porque uma reconexão pode trocar o socket a qualquer
+    momento, em background, sem a thread principal saber previamente.
     """
 
     def __init__(self):
         self.sala_atual = "geral"
+        self.ip: Optional[str] = None
+        self.porta: Optional[int] = None
+        self.nome: Optional[str] = None
+        self.senha: Optional[str] = None
+        self.sock: Optional[socket.socket] = None
+        self.lock = threading.Lock()
 
 
 def imprimir_mensagem(msg: dict, estado: EstadoCliente) -> None:
@@ -354,12 +416,15 @@ def _imprimir_minha_mensagem_privada(destinatario: str, texto: str) -> None:
 # Login
 # --------------------------------------------------------------------------
 
-def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
+def realizar_login(sock: socket.socket) -> Tuple[str, str, bytes]:
     """
     Pede um apelido e senha ao usuário, envia 'login' (via
     protocolo.msg_login) e espera a resposta do servidor.
 
-    - Se vier login_ok: retorna (nome_confirmado, buffer_restante).
+    - Se vier login_ok: retorna (nome_confirmado, senha, buffer_restante).
+      A senha é devolvida junto (e não descartada) porque main() precisa
+      guardá-la em EstadoCliente para a reconexão automática poder
+      reautenticar sozinha mais tarde, sem perguntar de novo ao usuário.
       buffer_restante contém quaisquer bytes já recebidos além da
       resposta de login (ex: se o servidor emendou uma notificação no
       mesmo pacote) — repassado para thread_recepcao() não perder nada.
@@ -440,7 +505,7 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
 
             if resposta["tipo"] == protocolo.TIPO_LOGIN_OK:
                 _ok(f"login bem-sucedido como '{resposta['nome']}'.")
-                return resposta["nome"], buffer
+                return resposta["nome"], senha, buffer
 
             _aviso(f"login recusado: {resposta['motivo']}")
             # volta ao topo do laço externo para pedir outro apelido
@@ -457,76 +522,212 @@ def realizar_login(sock: socket.socket) -> Tuple[str, bytes]:
 # Thread de recepção
 # --------------------------------------------------------------------------
 
-def _encerrar_conexao_forcado(sock: socket.socket, mensagem: str) -> None:
+def _encerrar_processo_final() -> None:
     """
-    Usado pela thread de recepção quando a conexão cai por um motivo que
-    não foi a thread principal pedindo para encerrar (ex: servidor caiu,
-    cabo de rede foi desconectado). Nesse momento a thread principal
-    muito provavelmente está bloqueada em input(), esperando o usuário
-    digitar algo — e input() é uma chamada bloqueante que não escuta
-    eventos (threading.Event) nem sockets, só o teclado. Não existe
-    forma portátil e simples (sem depender de bibliotecas extras) de
-    "acordar" educadamente essa chamada.
+    Usado quando a reconexão automática esgota todas as tentativas (ou
+    é cancelada) e não há mais nada a fazer. Nesse momento a thread
+    principal quase certamente está bloqueada em input(), esperando o
+    usuário digitar algo — e input() é uma chamada bloqueante que não
+    escuta eventos (threading.Event) nem sockets, só o teclado. Não
+    existe forma portátil e simples (sem depender de bibliotecas
+    extras) de "acordar" educadamente essa chamada.
 
     Por isso, em vez de deixar o programa preso esperando o usuário
-    apertar Enter para só então perceber que a conexão caiu, avisamos o
-    usuário, fechamos o socket corretamente e encerramos o processo
-    aqui mesmo. os._exit() (em vez de sys.exit()) é necessário porque
-    sys.exit() apenas levanta SystemExit, que uma thread secundária não
-    consegue propagar para a thread principal bloqueada em input().
+    apertar Enter para só então perceber que a sessão acabou, o processo
+    encerra sozinho aqui. os._exit() (em vez de sys.exit()) é necessário
+    porque sys.exit() apenas levanta SystemExit, que uma thread
+    secundária não consegue propagar para a thread principal bloqueada
+    em input().
     """
-    print(f"\n{_c(mensagem, _Cor.VERMELHO)}")
+    os._exit(1)
+
+
+def _dormir_interrompivel(segundos: float, evento_encerrando: threading.Event) -> None:
+    """
+    Equivalente a time.sleep(segundos), mas verificando
+    evento_encerrando a cada fração de segundo — permite que /sair ou
+    Ctrl+C interrompam a espera entre tentativas de reconexão na hora,
+    em vez de precisar esperar o intervalo inteiro (que pode chegar a
+    RECONEXAO_ESPERA_MAXIMA_SEGUNDOS) para perceber o pedido de saída.
+    """
+    fim = time.time() + segundos
+    while not evento_encerrando.is_set():
+        restante = fim - time.time()
+        if restante <= 0:
+            return
+        time.sleep(min(0.2, restante))
+
+
+def _relogar_automaticamente(
+    sock: socket.socket, nome: str, senha: str
+) -> Tuple[bool, bytes, Optional[str]]:
+    """
+    Reenvia login e senha automaticamente logo após uma reconexão, sem
+    perguntar nada ao usuário — as credenciais já foram fornecidas no
+    login original desta sessão (ver EstadoCliente).
+
+    Diferente de realizar_login(), não pede um nome novo se a
+    autenticação falhar: se o mesmo nome não puder ser reutilizado (por
+    exemplo, se outra pessoa o registrou nesse meio-tempo em que a
+    conexão esteve caída), a reconexão automática é abandonada —
+    repetir a mesma tentativa não resolveria isso sozinha, e pedir um
+    nome diferente no meio de uma reconexão automática, sem garantia de
+    que o usuário esteja olhando pra tela nesse momento, criaria mais
+    confusão do que ajuda.
+
+    Retorna (True, buffer_restante, None) em caso de sucesso, ou
+    (False, b"", motivo) em caso de falha.
+    """
+    buffer = b""
     try:
-        sock.close()
-    except OSError:
-        pass
-    os._exit(0)
+        sock.sendall(protocolo.serializar(protocolo.msg_login(nome, senha)))
+    except OSError as erro:
+        return False, b"", f"falha ao enviar login ({erro})"
+
+    sock.settimeout(TIMEOUT_CONEXAO)
+    try:
+        while True:
+            try:
+                dados = sock.recv(4096)
+            except socket.timeout:
+                return False, b"", f"tempo esgotado ({TIMEOUT_CONEXAO:.0f}s) esperando resposta de login"
+            except OSError as erro:
+                return False, b"", f"conexão perdida durante nova autenticação ({erro})"
+
+            if not dados:
+                return False, b"", "servidor fechou a conexão durante nova autenticação"
+
+            buffer += dados
+            try:
+                mensagens, buffer = protocolo.extrair_mensagens(buffer)
+            except protocolo.ErroProtocolo as erro:
+                return False, b"", f"erro de protocolo durante nova autenticação ({erro})"
+
+            for msg in mensagens:
+                if msg["tipo"] == protocolo.TIPO_LOGIN_OK:
+                    return True, buffer, None
+                if msg["tipo"] == protocolo.TIPO_LOGIN_ERRO:
+                    return False, b"", msg.get("motivo", "login recusado")
+    finally:
+        try:
+            sock.settimeout(None)
+        except OSError:
+            pass
 
 
-def thread_recepcao(
+def _tentar_reconectar(estado: "EstadoCliente", evento_encerrando: threading.Event) -> Tuple[bool, bytes]:
+    """
+    Chamada quando a conexão cai de forma inesperada (não solicitada
+    pelo usuário). Tenta reconectar ao mesmo endereço, com espera
+    exponencial entre tentativas (RECONEXAO_ESPERA_INICIAL_SEGUNDOS,
+    dobrando a cada falha até o teto de RECONEXAO_ESPERA_MAXIMA_SEGUNDOS),
+    até um total de RECONEXAO_DESISTIR_APOS_SEGUNDOS gasto em tentativas
+    malsucedidas seguidas.
+
+    Ao reconectar com sucesso:
+        1. reautentica sozinha, com o nome e a senha usados no login
+           original (_relogar_automaticamente);
+        2. se o usuário estava numa sala diferente de "geral", pede
+           para entrar nela de novo (todo login novo começa em "geral"
+           do lado do servidor, então isso precisa ser refeito
+           manualmente aqui);
+        3. pede o histórico recente da sala, para o usuário recuperar o
+           que foi trocado por outras pessoas enquanto a conexão estava
+           caída.
+
+    Retorna (True, buffer_restante) se reconectou e reautenticou; ou
+    (False, b"") se desistiu — por esgotar o tempo total, por Ctrl+C,
+    ou porque a reautenticação com as mesmas credenciais foi recusada.
+    """
+    print()
+    _aviso("conexão perdida com o servidor. Tentando reconectar automaticamente...")
+
+    espera = RECONEXAO_ESPERA_INICIAL_SEGUNDOS
+    tempo_gasto = 0.0
+    tentativa = 0
+
+    try:
+        while tempo_gasto < RECONEXAO_DESISTIR_APOS_SEGUNDOS:
+            if evento_encerrando.is_set():
+                return False, b""
+
+            tentativa += 1
+            _info(f"nova tentativa em {espera:.0f}s (tentativa {tentativa})...")
+            _dormir_interrompivel(espera, evento_encerrando)
+            tempo_gasto += espera
+
+            if evento_encerrando.is_set():
+                return False, b""
+
+            sock_novo, motivo = _tentar_conectar_uma_vez(estado.ip, estado.porta)
+            if sock_novo is None:
+                _aviso(f"tentativa {tentativa} falhou ({motivo})")
+                espera = min(espera * 2, RECONEXAO_ESPERA_MAXIMA_SEGUNDOS)
+                continue
+
+            sucesso_login, buffer_novo, motivo_login = _relogar_automaticamente(
+                sock_novo, estado.nome, estado.senha
+            )
+            if not sucesso_login:
+                _erro(f"reconectou, mas não foi possível autenticar de novo: {motivo_login}. Encerrando.")
+                try:
+                    sock_novo.close()
+                except OSError:
+                    pass
+                return False, b""
+
+            with estado.lock:
+                estado.sock = sock_novo
+            _ok(f"reconectado a {estado.ip}:{estado.porta} como '{estado.nome}'.")
+
+            if estado.sala_atual != "geral":
+                try:
+                    sock_novo.sendall(protocolo.serializar(protocolo.msg_entrar_sala(estado.sala_atual)))
+                except OSError:
+                    pass
+
+            try:
+                sock_novo.sendall(protocolo.serializar(protocolo.msg_historico()))
+            except OSError:
+                pass
+
+            return True, buffer_novo
+    except KeyboardInterrupt:
+        _info("reconexão cancelada pelo usuário.")
+        return False, b""
+
+    _erro(f"não foi possível reconectar após {RECONEXAO_DESISTIR_APOS_SEGUNDOS / 60:.0f} minutos tentando. Encerrando.")
+    return False, b""
+
+
+def _receber_ate_cair(
     sock: socket.socket,
     buffer_inicial: bytes,
     evento_encerrando: threading.Event,
-    estado: EstadoCliente,
+    estado: "EstadoCliente",
 ) -> None:
     """
-    Roda em thread separada. Só faz três coisas, nesta ordem, em loop:
-    recebe bytes do socket, desserializa via protocolo.extrair_mensagens,
-    imprime cada mensagem completa. Nunca lê input() do usuário.
+    Núcleo de recepção de mensagens para UMA conexão específica. Só faz
+    três coisas, nesta ordem, em loop: recebe bytes do socket,
+    desserializa via protocolo.extrair_mensagens, imprime cada mensagem
+    completa. Nunca lê input() do usuário.
 
-    Encerra quando evento_encerrando é sinalizado (pela thread principal,
-    em encerrar()) ou quando a conexão cai por qualquer motivo.
-
-    Distinção importante entre dois casos de recv()/OSError falhando:
-        1. evento_encerrando já estava setado -> foi a thread principal
-           que fechou o socket de propósito (usuário digitou /sair ou
-           Ctrl+C, via encerrar()). É o caminho normal de desligamento:
-           não há erro real, só terminamos o loop em silêncio.
-        2. evento_encerrando não estava setado -> a conexão caiu por
-           conta própria (servidor encerrou, cabo caiu, etc.) enquanto
-           a sessão estava ativa. Aí sim é um erro de verdade, tratado
-           por _encerrar_conexao_forcado() (ver docstring acima).
-    Sem essa distinção, um /sair normal do usuário (que fecha o socket
-    de propósito) seria erroneamente relatado como "conexão perdida".
+    Sempre retorna (nunca encerra o processo diretamente) quando a
+    conexão cai ou evento_encerrando é sinalizado — quem chama
+    (supervisionar_conexao) decide, olhando para evento_encerrando, se
+    isso foi um pedido de saída do usuário ou uma queda inesperada que
+    deve disparar uma tentativa de reconexão.
     """
     buffer = buffer_inicial
 
     while not evento_encerrando.is_set():
         try:
             dados = sock.recv(4096)
-        except (ConnectionResetError, BrokenPipeError):
-            if evento_encerrando.is_set():
-                break
-            _encerrar_conexao_forcado(sock, "[erro] conexão perdida com o servidor.")
         except OSError:
-            # Caso mais comum aqui: socket fechado localmente por
-            # encerrar() (thread principal) — desligamento esperado.
-            break
+            return  # conexão caiu ou foi fechada localmente -- quem chama decide o que fazer
 
         if not dados:
-            if evento_encerrando.is_set():
-                break
-            _encerrar_conexao_forcado(sock, "[servidor] conexão encerrada pelo servidor.")
+            return  # servidor fechou a conexão -- idem
 
         buffer += dados
         try:
@@ -538,7 +739,61 @@ def thread_recepcao(
         for msg in mensagens:
             imprimir_mensagem(msg, estado)
 
-    evento_encerrando.set()
+
+def supervisionar_conexao(
+    estado: "EstadoCliente",
+    evento_encerrando: threading.Event,
+    buffer_inicial: bytes,
+) -> None:
+    """
+    Roda em thread separada durante toda a sessão, alternando entre dois
+    papéis:
+        1. recepção normal (_receber_ate_cair), enquanto a conexão atual
+           estiver de pé;
+        2. reconexão automática com espera exponencial
+           (_tentar_reconectar), sempre que a conexão cair de forma
+           inesperada (não solicitada pelo usuário).
+
+    Ao reconectar com sucesso, volta ao papel 1 usando o novo socket
+    (guardado em estado.sock); ao desistir de vez, encerra o processo
+    (_encerrar_processo_final) — não há como continuar a sessão sem
+    conexão nenhuma e sem expectativa razoável de recuperá-la.
+    """
+    buffer = buffer_inicial
+
+    while not evento_encerrando.is_set():
+        with estado.lock:
+            sock_atual = estado.sock
+
+        _receber_ate_cair(sock_atual, buffer, evento_encerrando, estado)
+        buffer = b""
+
+        if evento_encerrando.is_set():
+            return  # pedido de saída do usuário (/sair ou Ctrl+C) -- não tenta reconectar
+
+        # A esta altura a conexão caiu de fato -- o socket antigo já não
+        # serve para nada, mas ainda precisa ser fechado explicitamente
+        # para liberar o descritor de arquivo antes de abrir um novo.
+        try:
+            sock_atual.close()
+        except OSError:
+            pass
+
+        sucesso, buffer = _tentar_reconectar(estado, evento_encerrando)
+        if not sucesso:
+            if evento_encerrando.is_set():
+                # evento_encerrando já estava setado (usuário pediu
+                # /sair ou Ctrl+C durante a tentativa de reconexão) --
+                # a própria main() já está fazendo o encerramento normal
+                # nesse caso; não é uma desistência de verdade, então
+                # NÃO deve encerrar o processo à força aqui.
+                return
+            # Desistência de verdade: esgotou o tempo total tentando, ou
+            # a reautenticação foi recusada pelo servidor. Aí sim não há
+            # mais nada a fazer sozinho.
+            evento_encerrando.set()
+            _encerrar_processo_final()
+            return
 
 
 # --------------------------------------------------------------------------
@@ -821,21 +1076,33 @@ def parse_comando(texto: str) -> Tuple[str, Optional[dict]]:
 # Encerramento
 # --------------------------------------------------------------------------
 
-def encerrar(sock: socket.socket, evento_encerrando: threading.Event) -> None:
+def encerrar(estado: "EstadoCliente", evento_encerrando: threading.Event) -> None:
     """
     Fecha a conexão de forma organizada.
+
+    Recebe `estado` (não um socket direto) porque o socket ativo pode
+    ter sido trocado por uma reconexão automática em algum momento da
+    sessão — o socket correto a fechar é sempre o mais atual
+    (estado.sock), nunca o que existia quando a sessão começou.
 
     O comando /sair (via parse_comando) apenas sinaliza para o main()
     encerrar localmente — não enviamos protocolo.msg_sair() pela rede,
     já que o servidor já trata desconexão abrupta como caminho normal,
     então simplesmente fechar o socket é suficiente e correto.
+
+    evento_encerrando é sinalizado ANTES de fechar o socket: é esse
+    sinal que faz supervisionar_conexao() (rodando em outra thread)
+    entender que este fechamento foi pedido pelo usuário, e não tentar
+    reconectar por conta própria.
     """
     evento_encerrando.set()
+    with estado.lock:
+        sock_atual = estado.sock
     try:
-        sock.shutdown(socket.SHUT_RDWR)
+        sock_atual.shutdown(socket.SHUT_RDWR)
     except OSError:
         pass  # já pode estar fechado do outro lado; não é um erro real aqui
-    sock.close()
+    sock_atual.close()
     _ok("conexão encerrada.")
 
 
@@ -862,23 +1129,30 @@ def main() -> None:
         _erro("--ip não pode ser vazio.")
         sys.exit(1)
 
-    # sock e thread começam como None: em caso de erro/Ctrl+C bem no
-    # início (antes de existirem), o bloco finally abaixo sabe o que
+    # sock, estado, thread começam como None: em caso de erro/Ctrl+C bem
+    # no início (antes de existirem), o bloco finally abaixo sabe o que
     # ainda precisa (ou não) ser limpo, sem depender de variáveis
     # inexistentes.
     sock: Optional[socket.socket] = None
+    estado: Optional[EstadoCliente] = None
     thread: Optional[threading.Thread] = None
     evento_encerrando: Optional[threading.Event] = None
 
     try:
         sock = conectar(ip, args.porta)
-        nome, buffer_inicial = realizar_login(sock)
+        nome, senha, buffer_inicial = realizar_login(sock)
 
         evento_encerrando = threading.Event()
         estado = EstadoCliente()
+        estado.ip = ip
+        estado.porta = args.porta
+        estado.nome = nome
+        estado.senha = senha
+        estado.sock = sock
+
         thread = threading.Thread(
-            target=thread_recepcao,
-            args=(sock, buffer_inicial, evento_encerrando, estado),
+            target=supervisionar_conexao,
+            args=(estado, evento_encerrando, buffer_inicial),
             daemon=True,
         )
         thread.start()
@@ -901,7 +1175,7 @@ def main() -> None:
                 break
 
             if evento_encerrando.is_set():
-                # servidor pode ter caído enquanto o usuário digitava
+                # servidor pode ter caído (e a reconexão desistido) enquanto o usuário digitava
                 break
 
             acao, mensagem = parse_comando(texto)
@@ -913,10 +1187,16 @@ def main() -> None:
                 _info(f"encerrando ({COMANDO_SAIR})...")
                 break
 
-            # acao == ACAO_ENVIAR
-            if not enviar(sock, mensagem):
-                _info("encerrando devido a falha no envio.")
-                break
+            # acao == ACAO_ENVIAR — lê o socket ATUAL (pode ter sido
+            # trocado por uma reconexão automática em segundo plano)
+            with estado.lock:
+                sock_atual = estado.sock
+            if not enviar(sock_atual, mensagem):
+                # Não encerra a sessão por causa disso: se a queda foi
+                # inesperada, supervisionar_conexao() já está cuidando
+                # de reconectar em background (ou já desistiu e vai
+                # encerrar o processo sozinha) — só avisamos e seguimos.
+                continue
 
             # Atualização otimista da sala local (ver EstadoCliente) —
             # feita só depois do envio ter sucesso, e só para os dois
@@ -936,9 +1216,9 @@ def main() -> None:
     except KeyboardInterrupt:
         _info("encerrando (Ctrl+C)...")
     finally:
-        if sock is not None and thread is not None and evento_encerrando is not None:
-            # Sessão completa: login concluído, thread de recepção rodando.
-            encerrar(sock, evento_encerrando)
+        if estado is not None and thread is not None and evento_encerrando is not None:
+            # Sessão completa: login concluído, thread de supervisão rodando.
+            encerrar(estado, evento_encerrando)
             thread.join(timeout=1)
         elif sock is not None:
             # Conectou, mas Ctrl+C interrompeu antes da thread iniciar

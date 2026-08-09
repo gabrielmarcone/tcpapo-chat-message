@@ -4,7 +4,7 @@
 
 [![Python Version](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Dependências](https://img.shields.io/badge/depend%C3%AAncias%20em%20produ%C3%A7%C3%A3o-nenhuma-brightgreen.svg)](#-tecnologias)
-[![Testes](https://img.shields.io/badge/testes-226%20passing-success.svg)](#-testes)
+[![Testes](https://img.shields.io/badge/testes-261%20passing-success.svg)](#-testes)
 [![Status](https://img.shields.io/badge/status-completo-success.svg)](#-funcionalidades)
 
 ---
@@ -36,7 +36,7 @@ tcpapo-chat-message/
 ├── persistencia.py    # Histórico de mensagens em SQLite
 ├── usuarios.py         # Cadastro de usuários e autenticação por senha (SQLite)
 ├── servidor.py          # Servidor TCP: accept loop, login, roteamento de mensagens
-└── cliente_app.py        # Cliente de terminal: conexão, comandos, interface colorida
+└── cliente_app.py        # Cliente de terminal: conexão, comandos, interface colorida, reconexão automática
 ```
 
 **Servidor**: uma thread principal em loop de `accept()`; cada cliente
@@ -47,6 +47,10 @@ simples e tolerante a fragmentação do TCP.
 ordem (login, troca de sala); cada cliente tem seu próprio lock de
 envio, pra mensagens de threads diferentes nunca se misturarem no
 mesmo socket.
+**Cliente**: uma thread de fundo cuida da recepção de mensagens e,
+se a conexão cair de forma inesperada, assume também a reconexão
+automática — reautenticando e restaurando a sessão sozinha, sem
+travar a thread principal (que continua livre pra ler o teclado).
 
 ---
 
@@ -63,6 +67,14 @@ mesmo socket.
 - [x] Listagem de usuários conectados, com a sala de cada um
 - [x] Salas temáticas, criadas livremente (`/entrar <sala>`)
 - [x] Encerramento controlado (`/sair`) e tratamento de queda abrupta
+
+### 🔌 Reconexão automática
+- [x] Detecta queda inesperada da conexão (servidor caiu, rede falhou) e tenta reconectar sozinho, sem precisar reiniciar o cliente
+- [x] Espera exponencial entre tentativas — 2s, 4s, 8s, 16s, até um teto de 30s — sem martelar o servidor
+- [x] Reautentica automaticamente com o mesmo nome e senha do login original, e restaura a sala em que o usuário estava
+- [x] Recupera o histórico recente da sala ao reconectar, para não perder o que foi trocado durante a queda
+- [x] Desiste com aviso claro após 5 minutos de tentativas sem sucesso — nunca fica tentando para sempre
+- [x] Cancelável a qualquer momento com `/sair` ou Ctrl+C, mesmo no meio de uma tentativa
 
 ### 🔒 Persistência & segurança
 - [x] Cadastro automático no primeiro login (sem etapa separada de "criar conta")
@@ -198,10 +210,10 @@ de maiúsculas/minúsculas.
 python -m pytest tests/ -v
 ```
 
-226 testes, cobrindo desde os módulos isolados até testes de
+261 testes, cobrindo desde os módulos isolados até testes de
 integração que sobem um servidor real e conectam clientes de teste de
-verdade nele — login, broadcast, salas, privadas, histórico e
-concorrência, tudo de ponta a ponta.
+verdade nele — login, broadcast, salas, privadas, histórico,
+reconexão automática e concorrência, tudo de ponta a ponta.
 
 Com relatório de cobertura:
 

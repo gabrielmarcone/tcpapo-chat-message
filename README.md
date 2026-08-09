@@ -4,7 +4,7 @@
 
 [![Python Version](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Dependências](https://img.shields.io/badge/depend%C3%AAncias%20em%20produ%C3%A7%C3%A3o-nenhuma-brightgreen.svg)](#-tecnologias)
-[![Testes](https://img.shields.io/badge/testes-261%20passing-success.svg)](#-testes)
+[![Testes](https://img.shields.io/badge/testes-288%20passing-success.svg)](#-testes)
 [![Status](https://img.shields.io/badge/status-completo-success.svg)](#-funcionalidades)
 
 ---
@@ -40,7 +40,9 @@ tcpapo-chat-message/
 ```
 
 **Servidor**: uma thread principal em loop de `accept()`; cada cliente
-aceito ganha sua própria thread, do login até a desconexão.
+aceito ganha sua própria thread, do login até a desconexão. Um segundo
+socket, UDP, roda numa thread à parte só para responder a pedidos de
+descoberta automática (ver seção de Funcionalidades).
 **Protocolo**: mensagens JSON, uma por linha, delimitadas por `\n` —
 simples e tolerante a fragmentação do TCP.
 **Concorrência**: um lock global serializa eventos que precisam manter
@@ -75,6 +77,12 @@ travar a thread principal (que continua livre pra ler o teclado).
 - [x] Recupera o histórico recente da sala ao reconectar, para não perder o que foi trocado durante a queda
 - [x] Desiste com aviso claro após 5 minutos de tentativas sem sucesso — nunca fica tentando para sempre
 - [x] Cancelável a qualquer momento com `/sair` ou Ctrl+C, mesmo no meio de uma tentativa
+
+### 🔍 Descoberta automática de servidor
+- [x] `--descobrir` como alternativa a `--ip`: encontra o servidor sozinho na rede local via UDP broadcast, sem precisar saber o endereço de antemão
+- [x] Se mais de um servidor responder (dois grupos testando ao mesmo tempo no laboratório, por exemplo), mostra uma lista para escolher
+- [x] Recurso independente do chat em si: se a rede bloquear broadcast ou a porta de descoberta estiver ocupada, o TCP continua funcionando normalmente — só a descoberta fica indisponível, com aviso claro
+- [x] `--ip` continua funcionando exatamente como sempre, sem nenhuma mudança — a descoberta é só mais uma opção, nunca obrigatória
 
 ### 🔒 Persistência & segurança
 - [x] Cadastro automático no primeiro login (sem etapa separada de "criar conta")
@@ -162,12 +170,16 @@ python servidor.py --porta 5000
 | `--porta` | `5000` | Porta TCP de escuta |
 | `--banco` | isolado por porta | Arquivo SQLite do histórico (padrão: `chat_historico_<porta>.db`) |
 | `--banco-usuarios` | `chat_usuarios.db` | Arquivo SQLite do cadastro de usuários |
+| `--porta-descoberta` | `5001` | Porta UDP para responder a pedidos de descoberta automática |
+| `--sem-descoberta` | desativado | Desliga a descoberta automática (o chat TCP não é afetado) |
 
 </details>
 
 ### 2. Conecte um cliente
 
-Em outro terminal (ou outra máquina da rede):
+Em outro terminal (ou outra máquina da rede), de duas formas:
+
+**Informando o IP manualmente:**
 
 ```bash
 python cliente_app.py --ip 127.0.0.1 --porta 5000
@@ -179,8 +191,22 @@ python cliente_app.py --ip 127.0.0.1 --porta 5000
 > qualquer máquina da rede local — só cuide da liberação de firewall na
 > máquina que roda o servidor.
 
-Ao conectar, escolha um apelido e uma senha. Primeiro login com um nome
-novo já cadastra a senha; nos seguintes, a mesma senha é exigida.
+**Ou deixando o cliente encontrar o servidor sozinho:**
+
+```bash
+python cliente_app.py --descobrir
+```
+
+Manda um broadcast UDP na rede local e conecta automaticamente a quem
+responder — útil quando não se sabe o IP do servidor de antemão. Se
+mais de um servidor responder, o cliente mostra uma lista para
+escolher. Não funciona através de roteador (só na mesma rede local) e
+pode ser bloqueado por Wi-Fi com isolamento de cliente ativado — nesse
+caso, use `--ip` manualmente.
+
+Ao conectar (por qualquer uma das duas formas), escolha um apelido e
+uma senha. Primeiro login com um nome novo já cadastra a senha; nos
+seguintes, a mesma senha é exigida.
 
 ---
 
@@ -210,10 +236,11 @@ de maiúsculas/minúsculas.
 python -m pytest tests/ -v
 ```
 
-261 testes, cobrindo desde os módulos isolados até testes de
+288 testes, cobrindo desde os módulos isolados até testes de
 integração que sobem um servidor real e conectam clientes de teste de
 verdade nele — login, broadcast, salas, privadas, histórico,
-reconexão automática e concorrência, tudo de ponta a ponta.
+reconexão automática, descoberta via UDP e concorrência, tudo de
+ponta a ponta.
 
 Com relatório de cobertura:
 
@@ -232,9 +259,11 @@ Mensagens são objetos JSON, um por linha, delimitados por `\n`:
 ```
 
 Todo o vocabulário do protocolo vive em `protocolo.py` — nenhuma outra
-parte do projeto monta ou interpreta JSON manualmente. Detalhes
-completos da arquitetura e das decisões de design em
-`relatorio/relatorio.md`.
+parte do projeto monta ou interpreta JSON manualmente. A descoberta
+automática de servidor usa esse mesmo formato, só que sobre UDP em vez
+de TCP: cada datagrama já é uma mensagem completa por si só, sem
+precisar do framing por `\n`. Detalhes completos da arquitetura e das
+decisões de design em `relatorio/relatorio.md`.
 
 ---
 
